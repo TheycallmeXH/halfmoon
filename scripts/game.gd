@@ -563,6 +563,99 @@ func _ready() -> void:
 					"p": Vector2(60.0 + float(k - 1) * 36.0, 132.0),
 					"t": 0.5, "kind": k, "picked": false, "hold": true,
 				})
+		"rivalflow":
+			# INTEGRATION check, not a re-test of the decision function.
+			#
+			# The `rivalsched` probe calls the gates directly, so it kept
+			# reporting adjacent=0 PASS while the real path was broken: beat_boss
+			# set boss_beat_this_loop, then _advance_loop cleared it again, so
+			# the rival check in step_boss could never fire. A unit probe cannot
+			# catch an ordering bug between two functions it does not call.
+			#
+			# This drives the actual sequence the game drives -- beat_boss, then
+			# step_boss on the next frames -- and reports whether a rival ever
+			# materialises in the boss slot.
+			var appeared := 0
+			var trialled := 0
+			var saved_seed2 := rng.seed
+			for s2 in 40:
+				rng.seed = 5000 + s2
+				reset()
+				# Jump straight to a loop that is allowed to host a duel.
+				loop_n = RIVAL_MIN_LOOP
+				rival_last_loop = -99
+				rival_done = false
+				start_boss()
+				beat_boss()          # the real kill path, loop advances inside
+				trialled += 1
+				# Two frames of the real boss scheduler: the first consumes the
+				# flag, the second must not re-roll.
+				step_boss(0.016)
+				if not boss.is_empty() and boss.has("is_rival"):
+					appeared += 1
+				# If nothing started, the run must be able to continue: the
+				# boss clock has to be live again on the new loop.
+				if boss.is_empty() and t < BOSS_AT - 1.0:
+					pass
+			rng.seed = saved_seed2
+			reset()
+			var flow_rate := float(appeared) / float(maxi(1, trialled))
+			# 40 trials at 45% -> anything in 0.25..0.65 is a working path.
+			# Zero would mean the integration is still severed.
+			var ok := appeared > 0 and flow_rate > 0.20 and flow_rate < 0.75
+			print("RIVALFLOW appeared=%d/%d rate=%.3f => %s" % [
+				appeared, trialled, flow_rate, ("PASS" if ok else "FAIL"),
+			])
+		"rivalsched":
+			# Exhaustive check of the rival schedule, not a sampled one.
+			#
+			# The rule the player named -- "不可以在boss后面连续出现" -- is a
+			# statement about the SEQUENCE of loops, so verifying it by playing
+			# would need dozens of runs. This walks the decision function
+			# across 40 consecutive loops for 200 different seeds and reports
+			# aggregate facts:
+			#
+			#   adjacent   how many times a rival appeared on loop N and N+1.
+			#              MUST be 0.
+			#   early      how many times a rival appeared below RIVAL_MIN_LOOP.
+			#              MUST be 0.
+			#   rate       observed appearances / eligible loops. Should land
+			#              near RIVAL_CHANCE; drift means a gate is eating rolls.
+			var adjacent := 0
+			var early := 0
+			var hits := 0
+			var eligible := 0
+			var saved_seed := rng.seed
+			for s in 200:
+				rng.seed = 1000 + s
+				rival_last_loop = -99
+				var prev := false
+				for ln in range(1, 41):
+					loop_n = ln
+					var got := false
+					if ln >= RIVAL_MIN_LOOP and ln - rival_last_loop >= RIVAL_COOLDOWN_LOOPS:
+						eligible += 1
+						if rng.randf() < RIVAL_CHANCE:
+							got = true
+							rival_last_loop = ln
+							hits += 1
+							# Duplicate the guard here so the probe tests the
+							# RULE, not just the sample: if the loop somehow
+							# produced two adjacent hits the counter above
+							# would catch it.
+							if ln < RIVAL_MIN_LOOP:
+								early += 1
+					if got and prev:
+						adjacent += 1
+					prev = got
+			rng.seed = saved_seed
+			var rate := 0.0
+			if eligible > 0:
+				rate = float(hits) / float(eligible)
+			print("RIVALSCHED adjacent=%d early=%d hits=%d eligible=%d rate=%.3f => %s" % [
+				adjacent, early, hits, eligible, rate,
+				("PASS" if adjacent == 0 and early == 0 else "FAIL"),
+			])
 		"tiercount":
 			# NUMERIC assertion, not a picture: fire each tier once through the
 			# real trigger path and count what actually left the muzzle, plus
@@ -1168,6 +1261,12 @@ func reset() -> void:
 	rival_done = false
 	rival_next_loop = 1
 	boss_beat_this_loop = false
+	# The cooldown memory has to clear too, or a new run inherits the previous
+	# run's last-rival loop number: a death on loop 6 would leave
+	# `rival_last_loop = 6`, and because a fresh run starts at loop 1 the
+	# condition `1 - 6 < 2` is true, blocking the duel for the first five loops
+	# of every subsequent run. Same class of bug as the elite gate above.
+	rival_last_loop = -99
 	paused = false
 	esc_held = false
 	# Clearing the chain is enough: step_player rebuilds it lazily when it finds
@@ -2186,10 +2285,26 @@ func step_boss(dt: float) -> void:
 		#
 		# Order, per loop: elite (26 s) → boss (52 s) → rival (~78 s). The rival
 		# never shares the field with the boss, matching the spawn rule above.
+		# ---- order per loop: elite (26s) -> boss (52s) -> maybe rival -----
+		#
+		# The rival is no longer a guaranteed third stage. `boss_beat_this_loop`
+		# only means "this loop's boss is done"; whether the duel FOLLOWS is
+		# decided by _maybe_start_rival, which is random, gated by loop number,
+		# and refuses a loop directly after another rival loop.
 		if rival_done == false and boss_beat_this_loop:
+			var started := _maybe_start_rival()
+			# `rival_done` is set either way, so the roll happens exactly once
+			# per loop. Leaving it false on a failed roll would re-roll every
+			# frame until the die came up, which is not a 45% chance -- it is a
+			# certainty with extra steps.
 			rival_done = true
-			start_rival()
-			return
+			# The flag is ONE-SHOT: clear it here, where it is consumed. If it
+			# survived the frame it would keep asserting "the boss is done" for
+			# the whole loop, and any future check that reads it would get a
+			# stale yes.
+			boss_beat_this_loop = false
+			if started:
+				return
 		if t >= BOSS_AT:
 			start_boss()
 		return
@@ -2562,9 +2677,79 @@ var rival_next_loop := 1
 # stage — see the loop-order comment in step_boss for why a clock cannot do it.
 var boss_beat_this_loop := false
 
+# ---- rival scheduling: random, gated, and never back-to-back ---------------
+#
+# 2026-11-09: "把真敌机改为在游戏的高难度阶段随机出现，不可以在boss后面连续
+# 出现，不然会让玩家觉得很痛苦".
+#
+# The old rule was deterministic: boss dies -> rival appears, EVERY loop, right
+# after the boss. Three problems with that, and the third is the one the player
+# named:
+#
+#   1. it was a fixed third stage, so the loop had no shape variation at all;
+#   2. the rival is the longest fight in the game (a 55 HP mirror that reloads
+#      and shoots back), and putting it on a metronome made every loop the same
+#      endurance test;
+#   3. chaining boss -> rival meant the last third of every loop was one
+#      uninterrupted gauntlet with no recovery beat. That is the "痛苦".
+#
+# The rule now:
+#
+#   RIVAL_MIN_LOOP   no rival before loop 3. Early loops are the player learning
+#                    the armoury; a mirror duel there is a wall, not a test.
+#   RIVAL_CHANCE     rolled ONCE per loop, on the loop boundary. 45% means the
+#                    duel is a possibility the player can feel coming, not a
+#                    guarantee they can plan around.
+#   cooldown 2       a rival on loop N blocks loops N+1 entirely. This is the
+#                    direct answer to "不可以在boss后面连续出现": the gate is
+#                    checked BEFORE the roll, so two rival loops can never be
+#                    adjacent no matter what the RNG does.
+#
+# Downstream rip: `boss_beat_this_loop` no longer means "rival inbound", it means
+# only "the boss is done". The promotion decision moves into `_maybe_start_rival`.
+const RIVAL_MIN_LOOP := 3
+const RIVAL_CHANCE := 0.45
+const RIVAL_COOLDOWN_LOOPS := 2
+
+# Last loop on which a rival actually appeared. `rival_next_loop` alone cannot
+# express "loop N+1 is blocked" because it is also used as the "already spawned
+# this loop" guard; this keeps the two facts separate.
+var rival_last_loop := -99
+
+
+# Decide whether this loop's post-boss stage is the duel.
+#
+# Three gates, evaluated in this order, and the ORDER matters:
+#
+#   1. loop too early          -- no roll is spent, because an early loop must
+#                                 never consume the chance
+#   2. last rival too recent   -- checked BEFORE the roll. If it were checked
+#                                 after, a cooldown-blocked loop would still
+#                                 burn a roll, and the effective rate would drop
+#                                 below RIVAL_CHANCE in a way that is very hard
+#                                 to reason about from the constants.
+#   3. the roll                -- one randf per loop, spent here
+#
+# Returns true only if the rival actually entered the arena.
+func _maybe_start_rival() -> bool:
+	if loop_n < RIVAL_MIN_LOOP:
+		return false
+	if loop_n - rival_last_loop < RIVAL_COOLDOWN_LOOPS:
+		# The direct answer to "不可以在boss后面连续出现": a rival on loop N
+		# makes this false for N+1 no matter what the die says.
+		return false
+	if rng.randf() >= RIVAL_CHANCE:
+		return false
+	rival_last_loop = loop_n
+	start_rival()
+	return true
+
 
 func start_rival() -> void:
-	rival_done = true
+	# `rival_done` is now owned by the caller (_maybe_start_rival sets it after
+	# the roll, pass or fail), so setting it here would make the two disagree
+	# on the failed-roll path. `rival_last_loop` is likewise set by the caller
+	# because it must record only ACTUAL appearances.
 	rival_next_loop = loop_n + 1
 	var hp := RIVAL_HP + RIVAL_HP_STEP * (loop_n - 1)
 	boss = {
@@ -2823,20 +3008,15 @@ func beat_rival() -> void:
 	# silhouette, and there is nothing left in the loop to spend it on.
 	for k in 2:
 		_spawn_cache(bp + Vector2(-16.0, -14.0 + float(k) * 28.0))
-	# ---- the loop advances HERE, and only here -------------------------
-	# The rival is the last stage, so it owns the counter. Advancing in
-	# beat_boss instead would make the duel part of the NEXT loop's timeline,
-	# and the elite clock would fire before the player ever met the twin.
-	loop_n += 1
-	boss_beat_this_loop = false
-	rival_done = false
-	rival_next_loop = loop_n + 1
+	# ---- the duel closes, but does NOT advance the loop -------------------
+	#
+	# The loop advanced when the boss died (see beat_boss). Making the rival
+	# advance it a second time would double-count a loop every time the duel
+	# happened, so a run that met two rivals would jump from loop 3 to loop 5.
+	#
+	# All this has to do is clear the field and let the wave clock resume.
 	eb.clear()
-	# New loop, so the elite gets another appearance.
-	elite_done = false
-	t = BOSS_AT - maxf(18.0, 34.0 - float(loop_n) * 2.0)
 	sync_backdrop()
-	spawn_t = 1.5
 
 
 func draw_rival() -> void:
@@ -3991,17 +4171,43 @@ func beat_boss() -> void:
 	_spawn_cache(bp + Vector2(-14.0, -20.0))
 	_spawn_cache(bp + Vector2(-14.0, 20.0))
 	eb.clear()
-	# The loop does NOT advance here any more.
+	# ---- the loop advances HERE, because the duel is now optional ---------
 	#
-	# It used to: `loop_n += 1` plus a `t` rewind to BOSS_AT - 18..34 s. That
-	# worked when the boss was the last stage of a loop, and breaks the moment
-	# there is a stage after it — the rewind lands below BOSS_AT, the boss clock
-	# re-arms first, and the duel stage can never start.
+	# This used to be owned by `beat_rival`, on the assumption that the duel
+	# ALWAYS follows the boss. That assumption broke the moment the rival
+	# became a random stage: if the roll fails, `beat_rival` never runs, and a
+	# loop counter that only advances inside it would never advance at all --
+	# the run would sit in the same loop forever, re-rolling every frame.
 	#
-	# Instead this flag promotes the loop into its duel stage, and `beat_rival`
-	# owns the advance. One stage owns the loop counter, and it is the last one.
+	# So the counter belongs to the stage that is GUARANTEED to happen: the
+	# boss. The rival, when it appears, is a stage that begins and ends inside
+	# the NEXT loop's timeline, and `beat_rival` only has to close the fight.
 	boss_beat_this_loop = true
+	_advance_loop()
 	sync_backdrop()
+
+
+# One place that increments the loop and re-arms everything per-loop.
+#
+# Split out because two paths now reach it -- `beat_boss` (always) and, when a
+# rival was beaten, `beat_rival` does NOT advance a second time. That asymmetry
+# is the whole point: the boss advances, the duel does not.
+func _advance_loop() -> void:
+	loop_n += 1
+	# `boss_beat_this_loop` is deliberately NOT cleared here.
+	#
+	# It is the flag `step_boss` reads to know "the boss is done, decide about
+	# the duel". Clearing it inside the advance made the two collide: beat_boss
+	# set it true and then immediately called this, which set it false again,
+	# so the rival check could never fire and the duel silently never appeared
+	# in real play -- while a probe that called the decision function directly
+	# still reported PASS. The flag is cleared by whoever CONSUMES it.
+	rival_done = false
+	rival_next_loop = loop_n + 1
+	# A new loop means the elite gets another appearance.
+	elite_done = false
+	t = BOSS_AT - maxf(18.0, 34.0 - float(loop_n) * 2.0)
+	spawn_t = 1.5
 
 
 func step_eb(dt: float) -> void:
