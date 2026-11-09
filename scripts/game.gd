@@ -189,7 +189,7 @@ const WEAPON_LAST := 7
 #   LASER    0.26    1        12   2.0 s   36      pierce 3, no splash
 #   FLAK     0.36    1x5      20   2.1 s   60      5 pellets +/-24 deg + shards
 #   RAIL     0.62    3         6   2.4 s   18      pierce 3, heavy single rod
-#   SWARM    0.34    1x3      18   1.9 s   54      3 darts, one steer each
+#   SWARM    0.34    1x2      18   1.9 s   54      2 darts, one steer each
 #
 # `dmg` is per PELLET. The rounds-per-volley column is implicit: one trigger
 # pull spends one round no matter how many pellets leave the muzzle.
@@ -199,7 +199,7 @@ const WEAPON_RELOAD := [1.5, 2.2, 1.6, 2.0, 2.0, 2.1, 2.4, 1.9]
 const WEAPON_RESERVE := [-1, 50, 120, 54, 36, 60, 18, 54]
 
 const WEAPON_CD := [0.19, 0.38, 0.105, 0.22, 0.26, 0.36, 0.62, 0.34]
-const WEAPON_DMG := [1, 5, 1, 1, 1, 1, 3, 1]
+const WEAPON_DMG := [1, 5, 1, 1, 1, 1, 2, 1]
 const WEAPON_GLYPH := ["", "B", "G", "S", "L", "F", "R", "W"]
 
 # Blast: radius in source pixels, and damage to everything except the direct
@@ -563,8 +563,41 @@ func _ready() -> void:
 					"p": Vector2(60.0 + float(k - 1) * 36.0, 132.0),
 					"t": 0.5, "kind": k, "picked": false, "hold": true,
 				})
+		"tiercount":
+			# NUMERIC assertion, not a picture: fire each tier once through the
+			# real trigger path and count what actually left the muzzle, plus
+			# the damage each round carries.
+			#
+			# A picture cannot answer "is a SWARM volley 2 darts or 3" -- darts
+			# that overlap on a 384px raster look the same either way, and the
+			# `tier` probe PLACES its rounds rather than firing them, so it
+			# never exercises the volley loop at all. A balance number needs a
+			# probe that reads the number.
+			var report := ""
+			for tw2 in range(WEAPON_BASE, WEAPON_LAST + 1):
+				pb.clear()
+				weapon = tw2
+				mag[tw2] = int(WEAPON_MAG[tw2])
+				stock[tw2] = int(WEAPON_RESERVE[tw2])
+				cooldown = 0.0
+				reloading = false
+				# The real fire path, so a volley that builds N pellets is
+				# measured through the same code the player uses.
+				var saved_trigger := trigger
+				trigger = true
+				step_fire(0.0)
+				trigger = saved_trigger
+				var n := pb.size()
+				var d0 := 0
+				if n > 0:
+					d0 = int((pb[0] as Dictionary).get("dmg", 0))
+				report += " %d:%dx%d" % [tw2, n, d0]
+			pb.clear()
+			weapon = WEAPON_BASE
+			mag[WEAPON_BASE] = int(WEAPON_MAG[WEAPON_BASE])
+			reloading = false
+			print("TIERCOUNT%s" % report)
 		"tier":
-			# ONE tier armed and one round PLACED mid-field, so a tier whose
 			# silhouette is only 1~2px wide can be photographed at a known
 			# position instead of wherever a real shot happens to be on the
 			# shutter frame.
@@ -1882,10 +1915,24 @@ func step_fire(dt: float) -> void:
 		return
 
 	if weapon == WEAPON_RAIL:
-		# One heavy rod. Three damage, three craft, a 0.62 s cadence -- the
-		# slowest trigger in the game. It is the only round whose weight is
-		# carried by LENGTH (12 px) rather than by the tail, so at a glance it
-		# reads as a solid object crossing the field rather than a tracer.
+		# One heavy rod. Pierce 3, a 0.62 s cadence -- the slowest trigger in
+		# the game. It is the only round whose weight is carried by LENGTH
+		# (12 px) rather than by the tail, so at a glance it reads as a solid
+		# object crossing the field rather than a tracer.
+		#
+		# DAMAGE 3 -> 2 on 2026-11-09 ("继续削穿甲弹的伤害，建议砍半").
+		#
+		# Literal halving is 1.5, and this is an integer damage system, so the
+		# only two real candidates were 2 and 1. 1 was rejected on arithmetic:
+		# pierce 3 x 1 damage is 3 total, which is strictly WORSE than BASE's
+		# single-target 5.26 DPS while costing a 0.62 s cadence and a 6-round
+		# magazine -- the tier would stop being a tier. 2 gives 6 total across
+		# a full column, i.e. 1.14x BASE's single-target output, and 0.38x of
+		# the old 3-per-pierce. That is "roughly halved" in practice without
+		# deleting the tier.
+		#
+		# The tier's identity stays pierce, not damage: it is the only round
+		# that pays off for lining craft up.
 		pb.append({
 			"p": muzzle,
 			"v": Vector2(SHOT_SPEED * 1.25, 0.0),
@@ -1898,18 +1945,24 @@ func step_fire(dt: float) -> void:
 		return
 
 	if weapon == WEAPON_SWARM:
-		# Three darts, each allowed a LIMITED number of steering events (see
-		# step_pb). Speed raised 0.80 -> 1.45 of SHOT_SPEED on 2026-11-09 ("将
-		# 其子弹飞行速度大幅提升"): the tier's problem was that a dart which has
-		# to correct could not catch anything it had already passed.
+		# Two darts, each allowed a LIMITED number of steering events (see
+		# step_pb). Speed raised 0.80 -> 1.45 of SHOT_SPEED on 2026-11-09: the
+		# tier's problem was that a dart which has to correct could not catch
+		# anything it had already passed.
 		#
-		# Each dart is given its OWN steering budget and its own start offset,
-		# and step_pb assigns them DIFFERENT targets. That is the fix for the
-		# homing bug: all three used to lock the single nearest craft on the
-		# first frame out of the muzzle, so they arrived as one overlapping
-		# point and missed together the moment that craft drifted.
-		for k in 3:
-			var a := deg_to_rad((float(k) - 1.0) * 9.0)
+		# COUNT 3 -> 2 on 2026-11-09 ("把追踪弹的一发三颗变成两颗").
+		#
+		# The fan is now built around TWO darts instead of three, and that
+		# changes the angles, not just the loop bound. A 3-dart fan spread
+		# (-9, 0, +9) has a centre dart; with two there is no centre, so the
+		# pair is offset symmetrically at (+/-4.5) to keep the volley centred
+		# on the aim line. Reusing the old angles with a bound of 2 would fire
+		# (-9, 0) -- both darts on the same side of where the player aimed.
+		#
+		# `lane` still numbers the darts 0..1, and step_pb picks the lane-th
+		# nearest target, so the two still split across two different craft.
+		for k in 2:
+			var a := deg_to_rad((float(k) - 0.5) * 9.0)
 			pb.append({
 				"p": muzzle,
 				"v": Vector2(SHOT_SPEED * 1.45, 0.0).rotated(a),
@@ -3436,10 +3489,10 @@ func step_foes(dt: float) -> void:
 						sh = 1.90
 						stop_t = 0.030
 					WEAPON_SWARM:
-						# Lightest contact in the game on purpose: three darts
-						# land in a quarter second, and anything heavier per dart
-						# would strobe the screen three times and stop reading as
-						# one volley.
+						# Lightest contact in the game on purpose: the darts
+						# land within a quarter second of each other, and
+						# anything heavier per dart would strobe the screen
+						# twice and stop reading as one volley.
 						heavy = 0.10
 						sparks_n = 2
 						flash_dur = 0.08
@@ -3708,12 +3761,17 @@ const SWARM_TURN_GAP := 0.10
 
 # One steering event for one dart.
 #
-# TARGET SELECTION, and this is the second half of the bug: three darts that
-# all lock the SAME craft arrive as one overlapping point, so the volley is
-# worth one dart's damage and misses together. Each dart carries a `lane`
-# 0/1/2 and picks the lane-th nearest craft instead, spreading the volley
-# across the field. With only one target alive, all three lanes collapse onto
-# it -- which is correct, because there is nothing else to shoot.
+# TARGET SELECTION, and this is the second half of the bug: darts that all lock
+# the SAME craft arrive as one overlapping point, so the volley is worth one
+# dart's damage and misses together. Each dart carries a `lane` 0..N-1 and
+# picks the lane-th nearest craft instead, spreading the volley across the
+# field. With only one target alive every lane collapses onto it -- which is
+# correct, because there is nothing else to shoot.
+#
+# The lane count is NOT hard-coded here: `_pick_target` clamps the lane to the
+# number of candidates, so this keeps working when the volley size changes.
+# It went from 3 darts to 2 on 2026-11-09 and only the firing loop needed the
+# edit -- which is what the clamp was for.
 #
 # Targets AHEAD of the dart are preferred; a craft already behind it cannot be
 # hit without the round turning around, and a round that turns around has
@@ -5170,9 +5228,13 @@ func _wake_cfg(wk: int, hostile := false) -> Dictionary:
 			# 2px behind the dot is the first cell the pad does not own, so the
 			# read is a dart with a bright leader trailing it -- and because the
 			# run is DENSE (hot_pitch 1) at the head of a DOTTED wake, the
-			# leader is the one solid stretch. Three darts per trigger, one
-			# volley in flight at 0.34s cadence -- 6px of the frame's budget in
-			# three tight 2px runs.
+			# leader is the one solid stretch.
+			#
+			# Budget: the volley went from 3 darts to 2 on 2026-11-09, so the
+			# per-frame CORE cost of a full barrage dropped from 6px to 4px
+			# (2 darts x 2px hot run at a 0.34s cadence). Re-tallied rather
+			# than left as the old number -- this comment is the only place
+			# the SWARM share of the glow budget is written down.
 			return {"ink": 0.82, "paper": 0.92, "paper_hold": 0.55,
 				"dash": true, "pitch": 2.0,
 				"hot": [3, 2], "hot_pitch": 1.0}
@@ -6006,7 +6068,12 @@ func _cache_shape(p: Vector2, kind: int) -> PackedVector2Array:
 #   FLAK     2 horizontal two bands -- a shell in segments
 #   RAIL     1 horizontal one rail, the full width
 #   LASER    1 vertical   one beam, the full height
-#   SWARM    3 dots       three darts, not lines at all
+#   SWARM    3 dots       three dots, not lines at all -- and NOT the volley
+#                          size. The plate is a permanent pickup identity; it
+#                          deliberately does not track how many darts leave the
+#                          muzzle, because a pickup whose icon changes shape
+#                          when a balance number moves is unreadable to anyone
+#                          who learned it yesterday.
 #
 # No two tiers share both a count and an orientation, and every seam stops
 # strictly inside the outline so the silhouette stays a clean square.
