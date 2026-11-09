@@ -1,0 +1,33 @@
+# Godot 4+ specific ignores
+.godot/
+/android/
+
+# Build output. `build/` holds the exported Windows binary (105MB) and the zip
+# next to it; neither belongs in a source repository -- the export preset in
+# export_presets.cfg is what makes them reproducible.
+build/
+*.zip
+*.pck
+
+# Debug / verification artefacts.
+# .shots holds dozens of MB of captured frames used while tuning the CRT
+# chain; they are regenerated on demand by .scripts/run_probe.ps1 and must
+# never be committed. This project has no git repository yet 鈥?the entries
+# are here so the first `git init` starts clean.
+.shots/
+shots/
+
+# Backups taken before risky edits. `.scripts/.backup/<timestamp>/` holds copies
+# of game.gd / ink.gd / boot.gd / NOTES.md from before each round of changes.
+# They are the rollback path while the project is outside version control; once
+# it is a repository, git is the rollback path and these are redundant.
+.scripts/.backup/
+
+# Tooling that is installed per machine, not shipped.
+.gdmcp/
+.dsh-meow/
+
+# Windows / editor noise
+Thumbs.db
+desktop.ini
+*.tmp
