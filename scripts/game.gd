@@ -6,11 +6,17 @@
 #   Space           ERASE, when the hatched gauge is full: wipes the screen
 #   R               restart after a blot-out
 #
-# Nothing on screen is a string: hull = tick marks, score = tally marks,
-# ink gauge = a hatched bar, loop count = ticks. The raster is upscaled 3x by
+# HUD: kills = digits, hull = hearts, ink gauge = a hatched bar,
+# loop count = ticks. The raster is upscaled by an integer factor by
 # the CRT shader on the wrapping SubViewportContainer.
 class_name Halfmoon
 extends Node2D
+
+const Waves = preload("res://scripts/waves.gd")
+const Specials = preload("res://scripts/special_enemies.gd")
+const EliteVariants = preload("res://scripts/elite_variants.gd")
+const HostileProjectiles = preload("res://scripts/hostile_projectiles.gd")
+const Passives = preload("res://scripts/passives.gd")
 
 const W := 384.0
 const H := 216.0
@@ -85,11 +91,23 @@ var rng := RandomNumberGenerator.new()
 var t := 0.0
 var hull := HULL_MAX
 var score := 0
+var kill_count := 0
 var gauge := 0.0
 var invuln := 0.0
 var dead := false
 var dead_t := 0.0
 var loop_n := 1
+var wave_clock := 0.0
+var wave_pending: Array[Dictionary] = []
+var wave_last := -1
+var wave_recent: Array[int] = []
+signal stage_changed
+var wave_name := "solo"
+var special_next_at := 20.0
+var drone_introduced := false
+var turret_introduced := false
+var special_last := Specials.Kind.TURRET
+var special_intro_waves := 0
 var boss: Dictionary = {}
 var flash := 0.0
 var shake := 0.0
@@ -122,12 +140,17 @@ var bones: Array[Vector2] = []
 var bones_vel: Array[Vector2] = []
 const BONE_COUNT := 6
 var hit_t := 0.0       # seconds since the last hit, drives the impact punch
+var health_clock := 0.0
 var kill_t := 0.0      # seconds since the last kill, drives the burst rings
 var hit_stop := 0.0    # remaining freeze time on impact, in seconds
 var fire_t := 0.0
 var cannon := 0
 var cooldown := 0.0
 var trigger := false
+var front_managed := false
+var run_elapsed := 0.0
+const FIRE_BUFFER_TIME := 0.10
+var fire_buffer := 0.0
 # Fires 1.0 -> 0.0 over ~0.12 s after each round leaves the muzzle. Drives the
 # discharge wave in the gun strip and the muzzle kick on the hull. Kept here
 # rather than derived in the HUD because drawing must not mutate state, and a
@@ -393,15 +416,18 @@ var esc_held := false
 #   3. it spawns much less often. Once per loop was still too frequent; it is
 #      now one per two loops, i.e. every other 52 s cycle.
 const ELITE_AT := 26.0
-const ELITE_LIFE := 11.0
+const ELITE_LIFE := 22.0
 const ELITE_EVERY := 2          # appear on loops 2, 4, 6 ...
 
 var elite_done := false
 var elite_next_loop := ELITE_EVERY
+var elite_deck: Array[int] = []
+var elite_last := -1
 
 var pb: Array[Dictionary] = []
 var eb: Array[Dictionary] = []
 var foes: Array[Dictionary] = []
+var special_remnants: Array[Dictionary] = []
 var sparks: Array[Dictionary] = []
 var rings: Array[Dictionary] = []
 
@@ -437,23 +463,22 @@ var blast_probe: Array[Dictionary] = []
 # three craft were still alive and said the blast did nothing.
 # ---- passive items -----------------------------------------------------------
 #
-# Three defensive pickups, on the SAME `caches` array as the weapon tiers, with
-# a `passive` field on the cache that says which one it is.
+# Eight passive pickups share the weapon cache lifecycle and a `passive` ID.
 #
 # Why one array and not a second one: the pickup path already owns magnetise,
 # the 14px grab radius, the 6s expiry and the `hold` probe escape. A parallel
 # array would need all four again, and the two would drift -- which is the
 # project's fourth silent failure, but with an entire subsystem attached.
 #
-# Three fields, three jobs, and each is read exactly once:
+# The original three effects keep their damage and reward rules:
 #
 #   ITEM_SHIELD  absorbs the next ITEM_SHIELD_CHARGES hits entirely. COMMON.
 #   ITEM_THORN   on contact, detonates a mid-size blast at the impact. RARE.
-#   ITEM_BARRAGE fires one half-field sweep the moment it is picked up. VERY RARE.
+#   ITEM_BARRAGE fires one half-field sweep the moment it is picked up. EPIC.
 #
 # "同道具不可叠加，只能刷新为初始状态" -- so each is a counter or a bool, and
-# picking a second one RESETS rather than adds. That is the whole reason the
-# state is three scalars and not three arrays.
+# picking a second one RESETS rather than adds; each effect owns a bounded
+# counter, timer or flag.
 #
 # "不同道具可以共存" -- they are independent fields, so nothing can shadow
 # anything else.
@@ -461,6 +486,11 @@ const ITEM_NONE := -1
 const ITEM_SHIELD := 0
 const ITEM_THORN := 1
 const ITEM_BARRAGE := 2
+const ITEM_MAGNET := 3
+const ITEM_RELOADER := 4
+const ITEM_CAPACITOR := 5
+const ITEM_PHASE := 6
+const ITEM_PHOENIX := 7
 
 const ITEM_SHIELD_CHARGES := 2
 # Blast radius on a contact. Larger than the player's BOMB (44) on purpose: the
@@ -471,25 +501,25 @@ const THORN_DMG := 5
 # rounded up, so one craft is always killed and three are never all left.
 const BARRAGE_FRACTION := 0.5
 
-# Drop odds, per cache that spawns. Tuned so the three are visibly different in
-# frequency: a shield roughly one cache in three, a thorn one in eleven, a
-# barrage one in twenty. Weapon tiers get whatever is left, which is still the
-# majority -- the armoury is the game, the passives are a floor under it.
-const ITEM_CHANCE_SHIELD := 0.30
-const ITEM_CHANCE_THORN := 0.09
-const ITEM_CHANCE_BARRAGE := 0.05
+# Drop weights, rarity and matching pickup/HUD glyphs live in Passives.
 
-# Live state. Two scalars, because only two of the three PERSIST:
+# Live state. Timed/charged effects persist; barrage's timer is HUD feedback only.
 #
 #   item_shield   charges remaining, decremented per hit absorbed
 #   item_thorn    armed until it fires once
 #
 # A barrage has no state at all -- "被拾取后立即清除一半敌人" means it fires the
 # instant the pickup lands and leaves nothing behind. A `item_barrage` flag
-# would be a field nothing ever reads, i.e. this project's twelfth silent
-# failure with a passive item built on top of it.
+# would be redundant. The short acknowledgement timer below never fires attacks.
 var item_shield := 0        # charges remaining
 var item_thorn := false     # armed until the next contact fires it
+var item_magnet := 0.0
+var item_reloader := 0.0
+var item_capacitor := 0
+var item_phase := false
+var item_phoenix := false
+var item_barrage_flash := 0.0
+var passive_pulse: Array[float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 var blast_landed := false
 var blast_impact_n := 0
@@ -1155,8 +1185,8 @@ func _ready() -> void:
 
 
 func sync_backdrop() -> void:
-	if backdrop != null and backdrop.has_method("set_moon"):
-		backdrop.set_moon(boss.is_empty())
+	if backdrop != null and backdrop.has_method("set_scenery"):
+		backdrop.set_scenery(boss.is_empty() or boss.has("is_elite"))
 
 
 # Single entry point for screen shake. Strength adds up to a cap, the age resets
@@ -1181,18 +1211,34 @@ func add_shake(amount: float, from_point := Vector2.INF) -> void:
 # Kept out of _process's hot path: called once per frame after the sim step.
 func feed_backdrop(dt: float) -> void:
 	if backdrop != null and backdrop.has_method("step"):
+		sync_backdrop()
+		backdrop.set_stage(loop_n)
 		backdrop.step(lag, dt)
 
 
 func reset() -> void:
+	stage_changed.emit()
+	run_elapsed = 0.0
 	t = 0.0
+	health_clock = 0.0
 	hull = HULL_MAX
 	score = 0
+	kill_count = 0
 	gauge = 0.0
 	invuln = 1.0
 	dead = false
 	dead_t = 0.0
 	loop_n = 1
+	wave_clock = 0.0
+	wave_pending.clear()
+	wave_last = -1
+	wave_recent.clear()
+	wave_name = "solo"
+	special_next_at = 20.0
+	drone_introduced = false
+	turret_introduced = false
+	special_last = Specials.Kind.TURRET
+	special_intro_waves = 0
 	boss = {}
 	flash = 0.0
 	shake = 0.0
@@ -1201,6 +1247,7 @@ func reset() -> void:
 	pb.clear()
 	eb.clear()
 	foes.clear()
+	special_remnants.clear()
 	sparks.clear()
 	rings.clear()
 	spawn_t = 0.8
@@ -1217,6 +1264,7 @@ func reset() -> void:
 	cooldown = 0.0
 	cannon = 0
 	trigger = false
+	fire_buffer = 0.0
 	shot_pulse = 0.0
 	hit_t = 0.0
 	kill_t = 0.0
@@ -1234,6 +1282,13 @@ func reset() -> void:
 	# would be the third time a per-run system leaked across `reset()`.
 	item_shield = 0
 	item_thorn = false
+	item_magnet = 0.0
+	item_reloader = 0.0
+	item_capacitor = 0
+	item_phase = false
+	item_phoenix = false
+	item_barrage_flash = 0.0
+	passive_pulse.fill(0.0)
 	wheel_pending = 0
 	reloading = false
 	reload_t = 0.0
@@ -1244,15 +1299,10 @@ func reset() -> void:
 	heal_t = 0.0
 	heal_acc = 0.0
 	elite_done = false
-	# The elite's loop gate has to be re-armed too, and this line was missing.
-	#
-	# `elite_done = false` alone looks like a full reset, but the gate is a
-	# separate variable: start_elite() sets elite_next_loop = loop_n + 2, and
-	# step_elite_clock only spawns while loop_n <= elite_next_loop. So a run that
-	# died on loop 5 left the gate at 7, and the next run 鈥?which starts at loop 1
-	# 鈥?passed the gate on loops 1, 2 and 3, spawning an elite on every loop
-	# instead of every second one. A restart silently changed the difficulty.
+	# Both the per-loop latch and the next eligible loop belong to this run.
 	elite_next_loop = ELITE_EVERY
+	elite_deck.clear()
+	elite_last = -1
 	# Rival stage: the flag, the promotion gate and the loop gate all have to go
 	# back to their start values, for the same reason the elite gate does above.
 	# `boss_beat_this_loop` in particular: leave it true and a fresh run starts
@@ -1273,6 +1323,8 @@ func reset() -> void:
 	# `bones` empty (see the flame skeleton block).
 	bones.clear()
 	bones_vel.clear()
+	if backdrop != null:
+		backdrop.reset_world()
 
 
 func _process(dt: float) -> void:
@@ -1292,6 +1344,7 @@ func _process(dt: float) -> void:
 		paused = not paused
 	esc_held = esc_now
 	if paused:
+		fire_buffer = 0.0
 		# Wheel input is dropped while paused, not banked. A notch rolled during
 		# a pause would otherwise fire on the first frame after unpausing, and
 		# the player would read it as a random tier change.
@@ -1319,6 +1372,7 @@ func _process(dt: float) -> void:
 		return
 
 	if dead:
+		fire_buffer = 0.0
 		dead_t += dt
 		flash = maxf(0.0, flash - dt * 2.4)
 		shake_age += dt
@@ -1330,7 +1384,7 @@ func _process(dt: float) -> void:
 		wheel_pending = 0
 		# R restarts, but also any of the fire keys, so the reflex that failed
 		# to dodge does something useful instead of replaying the death screen.
-		if dead_t > 0.6 and (Input.is_key_pressed(KEY_R)
+		if not front_managed and dead_t > 0.6 and (Input.is_key_pressed(KEY_R)
 			or Input.is_key_pressed(KEY_X) or Input.is_key_pressed(KEY_Z)
 			or Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)):
 			reset()
@@ -1338,7 +1392,10 @@ func _process(dt: float) -> void:
 		return
 
 	t += dt
-	shot_pulse = maxf(0.0, shot_pulse - dt / 0.12)
+	run_elapsed += dt
+	health_clock += dt
+	step_passives(dt)
+	shot_pulse = maxf(0.0, shot_pulse - dt / clampf(float(WEAPON_CD[weapon]) * 0.55, 0.045, 0.09))
 	flash = maxf(0.0, flash - dt * 3.2)
 	shake_age += dt
 	shake = maxf(0.0, shake - dt * 24.0)
@@ -1417,7 +1474,7 @@ func _process(dt: float) -> void:
 		# mag / stock / px / py are appended rather than interleaved: every
 		# existing probe script greps `wpn=` and reads to the end of the line,
 		# and a field inserted mid-string would silently break them.
-		print("DBG t=%.2f foes=%d pb=%d eb=%d boss=%s hp=%s fire=%.2f cache=%d wpn=%d rings=%d arrive=%.2f mag=%d stock=%d px=%.1f py=%.1f" % [
+		print("DBG t=%.2f foes=%d pb=%d eb=%d boss=%s hp=%s fire=%.2f cache=%d wpn=%d rings=%d arrive=%.2f mag=%d stock=%d px=%.1f py=%.1f wave=%s age=%.2f queued=%d" % [
 			t, foes.size(), pb.size(), eb.size(),
 			("elite" if boss.has("is_elite") else ("boss" if not boss.is_empty() else "-")),
 			(str(int(boss.get("hp", -1)) if not boss.is_empty() else "-")),
@@ -1425,6 +1482,7 @@ func _process(dt: float) -> void:
 			caches.size(), weapon, rings.size(),
 			float(boss.get("arrive", 0.0)),
 			mag[weapon], stock[weapon], player.x, player.y,
+			wave_name, wave_clock, wave_pending.size(),
 		])
 	queue_redraw()
 
@@ -1462,6 +1520,15 @@ func step_streak(dt: float) -> void:
 		streak_t = 0.0
 
 
+func credit_kill(reward: int = 1) -> void:
+	kill_count += 1
+	score += reward
+	if item_capacitor > 0:
+		item_capacitor -= 1
+		gauge = minf(1.0, gauge + 0.025)
+		passive_pulse[ITEM_CAPACITOR] = 0.35
+
+
 func note_kill(at: Vector2, tough: float) -> void:
 	# Called from the kill path. `tough` 0..1 scales how much the streak counts
 	# a kill for: a shard is 1, a coil is 1.5, the elite 3, the boss 6.
@@ -1496,31 +1563,8 @@ func _spawn_cache(at: Vector2) -> void:
 	# unreachable.
 	var x := clampi(int(at.x), int(FRAME.position.x) + 12, int(FRAME.end.x) - 12)
 	var y := clampi(int(at.y), int(FRAME.position.y) + 12, int(FRAME.end.y) - 12)
-	# ---- what this cache carries -----------------------------------------
-	# One roll decides between a passive item and a weapon tier, then the
-	# remaining cases fall to the armoury.
-	#
-	# Rolled in ITEM order, and each is a SEPARATE `randf()`, not a shared
-	# cumulative threshold. Two reasons:
-	#
-	#   1. a shared threshold makes the later odds depend on the earlier ones,
-	#      so tuning the shield's rate silently retunes the barrage's -- and
-	#      the code stops showing what the numbers mean;
-	#   2. the three are meant to read as "common / rare / very rare" in play,
-	#      and the only way to verify that is to be able to point at one
-	#      constant per item.
-	#
-	# `passive` is the field the pickup path reads. It is ITEM_NONE for every
-	# weapon cache, which is what `_grant_tier` already ignores -- so a weapon
-	# cache has NO extra field and behaves exactly as before.
-	var passive := ITEM_NONE
-	var roll := rng.randf()
-	if roll < ITEM_CHANCE_SHIELD:
-		passive = ITEM_SHIELD
-	elif roll < ITEM_CHANCE_SHIELD + ITEM_CHANCE_THORN:
-		passive = ITEM_THORN
-	elif roll < ITEM_CHANCE_SHIELD + ITEM_CHANCE_THORN + ITEM_CHANCE_BARRAGE:
-		passive = ITEM_BARRAGE
+	# One roll preserves the existing 44% passive / 56% weapon split.
+	var passive := Passives.roll(rng.randf())
 	caches.append({
 		"p": Vector2(float(x), float(y)),
 		"t": 0.0,
@@ -1584,9 +1628,7 @@ func _cycle_tier(dir: int) -> void:
 	for k in range(WEAPON_BOMB, WEAPON_LAST + 1):
 		if has_rounds(k):
 			ring.append(k)
-	# One candidate special: the wheel would otherwise spin on the spot and
-	# read as broken input.
-	if ring.size() <= 2:
+	if ring.size() <= 1:
 		return
 	var at := ring.find(weapon)
 	# The current tier is not in the ring, which happens for exactly one frame
@@ -1618,7 +1660,7 @@ func queue_wheel(dir: int) -> void:
 func step_reload(dt: float) -> void:
 	if not reloading:
 		return
-	reload_t += dt
+	reload_t += dt * (1.35 if item_reloader > 0.0 else 1.0)
 	if reload_t < reload_len:
 		return
 	_finish_reload()
@@ -1627,15 +1669,25 @@ func step_reload(dt: float) -> void:
 func _begin_reload() -> void:
 	if reloading:
 		return
+	if mag[weapon] >= int(WEAPON_MAG[weapon]):
+		return
 	# Nothing to load: an empty reservoir cannot be reloaded, so the tier simply
 	# ends and the base gun takes over. That is what makes the reservoir a real
 	# budget rather than a formality.
 	if int(WEAPON_RESERVE[weapon]) >= 0 and stock[weapon] <= 0:
-		_fall_back_to_base()
+		if mag[weapon] <= 0:
+			_fall_back_to_base()
 		return
 	reloading = true
 	reload_t = 0.0
 	reload_len = float(WEAPON_RELOAD[weapon])
+
+
+func request_reload() -> void:
+	if paused or dead:
+		return
+	fire_buffer = 0.0
+	_begin_reload()
 
 
 func _finish_reload() -> void:
@@ -1654,15 +1706,15 @@ func _finish_reload() -> void:
 # from a reservoir" is how a partial load ends up costing the wrong number of
 # rounds in one of the two places.
 func weapon_loaded() -> void:
-	var want: int = int(WEAPON_MAG[weapon])
+	var want := maxi(0, int(WEAPON_MAG[weapon]) - mag[weapon])
 	if int(WEAPON_RESERVE[weapon]) >= 0:
 		# Pull from the reservoir. A partial load is legal: a tier that has 5
 		# rounds left fills to 5, not to a full magazine it cannot pay for.
 		var take: int = mini(want, stock[weapon])
-		mag[weapon] = take
+		mag[weapon] += take
 		stock[weapon] -= take
 	else:
-		mag[weapon] = want
+		mag[weapon] += want
 
 
 func _fall_back_to_base() -> void:
@@ -1714,7 +1766,10 @@ func step_caches(dt: float) -> void:
 			continue
 		# Magnetise toward the player after 1.4 s, and drift while waiting so a
 		# stationary cache still reads as a live object.
-		if life > 1.4:
+		var magnetised := item_magnet > 0.0 and player.distance_to(c.p as Vector2) < 140.0
+		if magnetised:
+			c.p = (c.p as Vector2).move_toward(player, 180.0 * dt)
+		elif life > 1.4:
 			var to_p := (player - (c.p as Vector2))
 			if to_p.length() > 0.5:
 				c.p = (c.p as Vector2) + to_p.normalized() * minf(70.0, to_p.length() * 5.0) * dt
@@ -1800,6 +1855,7 @@ func step_player(dt: float) -> void:
 		trigger = true
 	if Input.is_key_pressed(KEY_SPACE):
 		if gauge >= 1.0:
+			fire_buffer = 0.0
 			do_erase()
 		else:
 			trigger = true
@@ -1902,26 +1958,37 @@ func step_player(dt: float) -> void:
 	lag = lag.lerp(-vel * 0.035, 1.0 - exp(-10.0 * dt))
 
 
+func queue_fire() -> void:
+	if not paused and not dead:
+		fire_buffer = FIRE_BUFFER_TIME
+
+
 func step_fire(dt: float) -> void:
-	# Cooldown model: a timer that always drains, but the trigger is what gates
-	# the shot. Holding fire gives a steady cadence; tapping gives exactly one
-	# round; releasing lets the cooldown finish while idle.
-	cooldown = maxf(0.0, cooldown - dt)
-	if not trigger:
+	var previous := cooldown
+	var remaining := cooldown - dt
+	cooldown = maxf(0.0, remaining)
+	fire_buffer = maxf(0.0, fire_buffer - dt)
+	if not trigger and fire_buffer <= 0.0:
 		return
-	# A reload outranks the trigger: holding fire through a change-over must
-	# not skip the refill, and it must not fire a shot either.
 	if reloading:
 		return
 	if cooldown > 0.0:
 		return
-	# Empty magazine: start the change-over and swallow this trigger pull.
-	# Doing it BEFORE the cooldown check means the reload begins on the same
-	# frame the last round is spent, not one frame later.
 	if mag[weapon] <= 0:
 		_begin_reload()
 		return
-	cooldown = float(WEAPON_CD[weapon])
+	# Retain the fractional frame only across an active cooldown. Idle time
+	# cannot be banked into a faster shot, and each frame emits at most once.
+	cooldown = float(WEAPON_CD[weapon]) + (minf(0.0, remaining) if previous > 0.0 else 0.0)
+	fire_buffer = 0.0
+	_emit_shot()
+	# Start loading on the last discharge, even when the trigger is released.
+	# An exhausted special stays selected until the next firing request.
+	if mag[weapon] <= 0 and (weapon == WEAPON_BASE or stock[weapon] > 0):
+		_begin_reload()
+
+
+func _emit_shot() -> void:
 	cannon = 1 - cannon
 	# One trigger pull = one round, regardless of how many pellets the tier
 	# throws. A SPREAD or FLAK volley still costs a single round.
@@ -2111,107 +2178,132 @@ func step_fire(dt: float) -> void:
 
 
 func step_spawn(dt: float) -> void:
-	if not boss.is_empty():
+	var support := not boss.is_empty() and not boss.has("is_rival")
+	if boss.has("is_rival") or (not support and (t >= BOSS_AT or boss_beat_this_loop)):
+		wave_pending.clear()
 		return
+	# Let the minor encounter finish unfolding before its first escort wave.
+	if support and float(boss.t) < 2.8:
+		return
+	wave_clock += dt
+	for i in range(wave_pending.size() - 1, -1, -1):
+		wave_pending[i].delay = float(wave_pending[i].delay) - dt
+		if float(wave_pending[i].delay) <= 0.0:
+			_spawn_wave_member(wave_pending[i])
+			wave_pending.remove_at(i)
 	spawn_t -= dt
 	if spawn_t > 0.0:
 		return
 	spawn_wave()
-	# Interval tightens with the clock AND the loop. The old `t * 0.004` term
-	# only bought 0.2s across a whole loop, so pacing never changed; 0.010 makes
-	# the last third visibly denser. The floor stays at 0.62 because with waves
-	# of up to three craft a 0.42 floor produced ~7 arrivals per second, which
-	# stops being a shmup and becomes a wall.
-	# Spawn cadence, eased.
-	#
-	# Was max(0.62, 1.55 - loop*0.10 - t*0.010): by t=45 s that sat on the 0.62
-	# floor with three craft per wave, i.e. ~4.8 craft per second arriving into
-	# a 384 px field. The floor was raised to 0.78 and the two ramp rates cut
-	# roughly in half, so the late game stays dense without turning into a wall:
-	# at t=45 s, loop 1, the interval is 1.10 s instead of 0.62 s 闂?a 44% cut
-	# in arrivals for the same wave size.
-	# Spawn cadence, eased again 鈥?this time the whole curve was lifted, not just
-	# the floor.
-	#
-	# At 0.78/1.55 the late game was still one wave every 0.9 s with up to three
-	# craft in it. Measured against the field, that is 3.3 craft/second arriving
-	# into 384 px, which the player cannot clear even with a full magazine 鈥?
-	# surviving depended on dodging rather than on shooting, and the run stopped
-	# feeling like a shmup.
-	#
-	# New floor 1.05 and a shallower ramp: at t=45 s, loop 1, the interval is
-	# 1.30 s instead of 0.98 s, roughly a 25% cut in arrivals for the same wave
-	# size. The floor is what matters most: it is the value the last third of
-	# every loop sits on.
-	spawn_t = maxf(1.05, 1.70 - float(loop_n) * 0.05 - t * 0.004)
 
 
 func spawn_wave() -> void:
-	# Difficulty ladder, expressed as "what is allowed to exist right now".
-	#
-	# The old version picked a random kind and only special-cased the first few
-	# seconds, so a run felt identical at 5s and at 45s: one craft every ~1.4s
-	# of the same two types. Now the roster opens up over time and the wave size
-	# grows with both the clock and the loop, so the last ten seconds before the
-	# boss are always the loudest part of the loop.
-	# ---- the ladder -------------------------------------------------------
-	# Two separate things ramp, and they used to ramp on the same clock, which is
-	# why the curve felt like a wall at t鈮?6 s rather than a slope:
-	#
-	#   ROSTER  which craft may appear. Opens once per third of the loop.
-	#   COUNT   how many arrive at once. This is the brutal one 鈥?it multiplies
-	#           with the roster, so unlocking the coil and doubling the wave on
-	#           the same second is a step, not a ramp.
-	#
-	# They are now staggered: the roster opens at 12/26, and the wave grows at
-	# 34 and again only on later loops. The single hardest frame of the curve is
-	# therefore a +1 craft, not a +1 craft of the worst type at the same time.
-	var kinds: Array[int] = [0]
-	if t > 12.0:
-		kinds.append(1)
-	if t > 26.0:
-		kinds.append(2)
-	# The second drift craft is a WEIGHT, not a new kind: it makes kind 1 twice
-	# as likely, which raises aimed fire without raising the ceiling.
-	if t > 40.0:
-		kinds.append(1)
+	if boss.has("is_rival"):
+		return
+	var support := not boss.is_empty()
+	var tuning := Waves.profile(loop_n, wave_clock, support)
+	var active := PackedInt32Array([0, 0, 0, 0, 0])
+	for foe in foes:
+		active[int(foe.kind)] += 1
+	for member in wave_pending:
+		active[int(member.kind)] += 1
+	var slots := int(tuning.field_cap) - foes.size() - wave_pending.size()
+	var wave := Waves.plan(loop_n, wave_clock, rng, wave_last, active, slots, wave_recent, support)
+	# A special replaces the wave's leader and spends the same threat budget.
+	# Reserving the whole shared slot prevents overlapping charge/beam attacks.
+	var special := _scheduled_special(active, slots, tuning)
+	if special >= 0:
+		var members: Array[Dictionary] = [{
+			"kind": special, "y": rng.randf_range(62.0, 154.0), "delay": 0.0, "amp": 0.0}]
+		if (drone_introduced if special == Specials.Kind.DRONE else turret_introduced):
+			var wings := mini(mini(slots - 1, 2), int(tuning.budget) - Waves.COST[special])
+			for wing in wings:
+				members.append({"kind": 0, "y": 52.0 if wing == 0 else 164.0,
+					"delay": 0.45, "amp": 6.0})
+		wave.members = members
+		wave.name = "drone" if special == Specials.Kind.DRONE else "turret"
+		wave.formation = Waves.Formation.ARROW if special == Specials.Kind.DRONE else Waves.Formation.ESCORT
+		drone_introduced = drone_introduced or special == Specials.Kind.DRONE
+		turret_introduced = turret_introduced or special == Specials.Kind.TURRET
+		special_last = special
+		special_next_at = wave_clock + (9.0 if special == Specials.Kind.DRONE else 12.0)
+		special_intro_waves = 2
+	elif special_intro_waves > 0:
+		for member in wave.members:
+			member.kind = 0
+		special_intro_waves -= 1
+	spawn_t = float(wave.interval)
+	if wave.members.is_empty():
+		return
+	wave_last = int(wave.formation)
+	# Newest first: shape selection can relax the oldest exclusions if needed.
+	if wave.members.size() > 1:
+		wave_recent.push_front(wave_last)
+		if wave_recent.size() > 4:
+			wave_recent.resize(4)
+	wave_name = str(wave.name)
+	for member in wave.members:
+		wave_pending.append(member)
 
-	var count := 1
-	if t > 34.0:
-		count += 1
-	# Loop scaling is gentler: +1 per loop after the first, capped at 2 total.
-	count += clampi(loop_n - 1, 0, 1)
-	# Three is the ceiling. At the 1.05 s floor, three arrivals is ~2.9 craft per
-	# second, which is already dense; four was a curtain.
-	count = mini(count, 3)
 
-	# Spread the wave vertically so a multi-craft spawn does not arrive as one
-	# solid wall the player cannot thread.
-	var span := H - 64.0
-	var step := span / float(count)
-	for n in count:
-		var y := 32.0 + step * (float(n) + 0.5) + rng.randf_range(-step * 0.22, step * 0.22)
-		y = clampf(y, 30.0, H - 30.0)
-		var kind: int = kinds[rng.randi_range(0, kinds.size() - 1)]
-		if kind == 0:
-			foe_shard(y)
-		elif kind == 1:
-			foe_drift(y)
-		else:
-			foe_coil(y)
+func _scheduled_special(active: PackedInt32Array, slots: int, tuning: Dictionary) -> int:
+	if not boss.is_empty() or loop_n < 2 or slots <= 0 or t > BOSS_AT - 6.0 or tuning.relief or special_intro_waves > 0:
+		return -1
+	if active[3] + active[4] > 0 or active[1] + active[2] >= int(tuning.shooter_cap):
+		return -1
+	if drone_introduced and wave_clock < special_next_at:
+		return -1
+	var kind := Specials.Kind.DRONE
+	if not drone_introduced:
+		if wave_clock < 20.0:
+			return -1
+	elif not turret_introduced and loop_n >= 3:
+		if wave_clock < 18.0:
+			return -1
+		kind = Specials.Kind.TURRET
+	else:
+		if wave_clock < special_next_at:
+			return -1
+		kind = Specials.Kind.TURRET if loop_n >= 3 and special_last == Specials.Kind.DRONE else Specials.Kind.DRONE
+	return kind if int(tuning.budget) >= Waves.COST[kind] else -1
+
+
+func _spawn_wave_member(member: Dictionary) -> void:
+	match int(member.kind):
+		0: foe_shard(float(member.y))
+		1: foe_drift(float(member.y))
+		2: foe_coil(float(member.y))
+		Specials.Kind.DRONE, Specials.Kind.TURRET:
+			foes.append(Specials.create(int(member.kind), float(member.y), loop_n))
+	var foe: Dictionary = foes.back()
+	foe.amp = float(member.amp)
+	# Start on the authored row even when the global game clock is far ahead.
+	if int(foe.kind) == 0:
+		foe.ph = -SPAWN_X * 0.033
+	elif int(foe.kind) == 1:
+		foe.ph = -t * 1.1
+	elif int(foe.kind) == 2:
+		foe.ph = -t * 1.35
+	foe.fire = float(foe.fire) + rng.randf_range(0.0, 0.30)
+
+
+func _cancel_specials(retreat: bool = true) -> void:
+	for foe in foes:
+		if int(foe.kind) >= Specials.Kind.DRONE:
+			Specials.cancel(foe, retreat)
 
 
 func foe_shard(y: float) -> void:
 	foes.append({
 		"kind": 0,
 		"p": Vector2(SPAWN_X, y),
-		"speed": 86.0 + float(loop_n) * 5.0,
+		"speed": 91.0 + float(mini(loop_n - 1, 6)) * 4.0,
 		# 2 HP at loop 1, then +1 every two loops instead of one every loop. A
 		# shard is the trash mob of the roster and it stopped being disposable
 		# around loop 3, when it took four shots with a 0.19s cooldown while
 		# four of them were already on screen.
-		"hp": 1 + int(ceil(float(loop_n) * 0.5)),
-		"max": 1 + int(ceil(float(loop_n) * 0.5)),
+		"hp": 2 + mini(int((loop_n - 1) / 2), 3),
+		"max": 2 + mini(int((loop_n - 1) / 2), 3),
 		# ph = 0 so the weave starts ON the spawn row. A random phase offsets y
 		# by up to amp on the very first frame, which reads as the craft
 		# appearing off its intended lane 闂?see foe_coil for the full argument.
@@ -2228,12 +2320,12 @@ func foe_drift(y: float) -> void:
 	foes.append({
 		"kind": 1,
 		"p": Vector2(SPAWN_X, y),
-		"speed": 39.0 + float(loop_n) * 3.0,
+		"speed": 42.0 + float(mini(loop_n - 1, 6)) * 2.0,
 		# 5 base, +1 every two loops (was +2 every loop). The drift craft fires
 		# every 1.75 s and its whole job is area denial, so it must not also be
 		# a bullet sponge.
-		"hp": 4 + loop_n,
-		"max": 4 + loop_n,
+		"hp": 5 + mini(loop_n - 1, 5),
+		"max": 5 + mini(loop_n - 1, 5),
 		# Kind 1's weave is driven by `t`, which starts at 0 for every run, so a
 		# random ph is harmless there and is kept for variety.
 		"ph": rng.randf() * TAU,
@@ -2253,8 +2345,8 @@ func foe_coil(y: float) -> void:
 		# 6 base, +1 every two loops (was +2 every loop). The coil parks and
 		# fires three-way spreads, so it already taxes the player's attention;
 		# its 7 + 2(loop-1) pool meant a mid-run coil ate a third of the gauge.
-		"hp": 5 + loop_n,
-		"max": 5 + loop_n,
+		"hp": 6 + mini(loop_n - 1, 5),
+		"max": 6 + mini(loop_n - 1, 5),
 		# ph = 0, not random.
 		#
 		# Kind 2's weave now runs from the spawn frame (see step_foes), so a
@@ -2308,7 +2400,7 @@ func step_boss(dt: float) -> void:
 		if t >= BOSS_AT:
 			start_boss()
 		return
-	# The boss OUTRANKS the elite.
+	# The boss outranks a stuck elite only after its full combat/exit window.
 	#
 	# Both live in the `boss` slot so only one major enemy exists at a time, but
 	# priority matters: when the boss clock arrives, whatever elite is still on
@@ -2317,7 +2409,7 @@ func step_boss(dt: float) -> void:
 	# was never constructed at all — which the player experienced as "the boss
 	# has no attacks".
 	if boss.has("is_elite"):
-		if t >= BOSS_AT:
+		if t >= BOSS_AT and float(boss.t) >= elite_combat_life() + 6.0:
 			var old: Vector2 = boss.p
 			boss = {}
 			puff(old, 10)
@@ -2349,7 +2441,15 @@ func step_boss(dt: float) -> void:
 		var nx: float = lerpf(bp.x, target, 1.0 - exp(-3.2 * dt))
 		boss.p = Vector2(maxf(target, nx), bp.y)
 		return
-	boss.p = Vector2(target, H * 0.5 + sin(bt * 0.72) * H * 0.26)
+	if not boss.has("station_t"):
+		boss.station_t = bt
+		boss.station_y = bp.y
+	var since := bt - float(boss.station_t)
+	# Continue from the actual arrival pose, not the already-running entry
+	# clock. Ease vertical motion in while the remaining horizontal gap closes.
+	var sway := sin(since * 0.72) * H * 0.26 * smoothstep(0.0, 0.6, since)
+	boss.p = Vector2(lerpf(bp.x, target, 1.0 - exp(-3.2 * dt)),
+		float(boss.station_y) + sway)
 	var frac := float(boss.hp) / float(boss.max)
 	boss.fire = float(boss.fire) - dt
 	if float(boss.fire) <= 0.0:
@@ -2463,6 +2563,10 @@ func step_chip(dt: float) -> void:
 
 
 func start_boss() -> void:
+	stage_changed.emit()
+	_cancel_specials()
+	wave_pending.clear()
+	spawn_t = maxf(spawn_t, 1.0)
 	# Health eased twice over: base 190 -> 165, and the per-loop ramp 62 -> 42.
 	# The boss is a 30-second damage check, and at 190 it asked for ~52 hits with
 	# a 0.19 s cooldown while the player was also dodging three-way spreads 闂?
@@ -2746,6 +2850,11 @@ func _maybe_start_rival() -> bool:
 
 
 func start_rival() -> void:
+	stage_changed.emit()
+	# The mirror fighter owns the field; clearing is not a kill or a reward.
+	foes.clear()
+	eb.clear()
+	wave_pending.clear()
 	# `rival_done` is now owned by the caller (_maybe_start_rival sets it after
 	# the roll, pass or fail), so setting it here would make the two disagree
 	# on the failed-roll path. `rival_last_loop` is likewise set by the caller
@@ -2780,6 +2889,7 @@ func start_rival() -> void:
 		"focus": false,
 		"is_rival": true,
 	}
+	sync_backdrop()
 
 
 func step_rival(dt: float) -> void:
@@ -2834,8 +2944,9 @@ func step_rival(dt: float) -> void:
 	v = v.lerp(target_v, 1.0 - exp(-acc * dt))
 	boss.vel = v
 	bp += v * dt
-	# Same clamp the player gets, so neither craft can leave the field.
-	bp.x = clampf(bp.x, LEFT_LIMIT, RIGHT_LIMIT)
+	# Allow the authored offscreen approach to cross the boundary naturally.
+	# Once inside, the rival uses the player's normal bounds.
+	bp.x = clampf(bp.x, LEFT_LIMIT, maxf(RIGHT_LIMIT, float(boss.p.x)))
 	bp.y = clampf(bp.y, TOP_LIMIT, BOTTOM_LIMIT)
 	boss.p = bp
 
@@ -2995,9 +3106,10 @@ func _cycle_rival_tier() -> void:
 
 
 func beat_rival() -> void:
+	stage_changed.emit()
 	var bp: Vector2 = boss.p
 	boss = {}
-	score += 18
+	credit_kill(18)
 	gauge = 1.0
 	add_shake(5.5)
 	flash = 0.62
@@ -3089,14 +3201,7 @@ func draw_rival() -> void:
 
 	# Paper halo, exactly as the player has: this is what keeps a black
 	# silhouette legible over the black moon.
-	var halo := PackedVector2Array()
-	for vtx in body:
-		var d: Vector2 = vtx - p
-		if d.length() > 0.5:
-			halo.append(vtx + d.normalized() * 1.6)
-		else:
-			halo.append(vtx)
-	Ink.fill_poly(self, halo, Color(PAPER.r, PAPER.g, PAPER.b, 0.92))
+	Ink.paper_edge(self, body)
 
 	var body_col := Color(INK.r, INK.g, INK.b, 1.0)
 	if hurt > 0.0:
@@ -3140,16 +3245,6 @@ func draw_rival() -> void:
 	# ---- health: a tick run above the craft -------------------------------
 	# Deliberately NOT the boss's curved arc: the rival wears the player's
 	# silhouette, so its health belongs in the player's own HUD language 鈥?	# a straight run of ticks, like the old hull marks.
-	var frac := float(boss.hp) / float(boss.max)
-	var ticks := 18
-	var lit := int(round(frac * float(ticks)))
-	for i in ticks:
-		var q := Vector2(p.x - 18.0 + float(i) * 2.0, p.y - 14.0)
-		if i < lit:
-			draw_rect(Rect2(floorf(q.x), floorf(q.y), 1.0, 3.0), INK, true)
-		else:
-			draw_rect(Rect2(floorf(q.x), floorf(q.y), 1.0, 1.0),
-				Color(INK.r, INK.g, INK.b, 0.25), true)
 
 	# ---- reload arc -------------------------------------------------------
 	# "He is reloading" has to be readable at a glance, because it is the one
@@ -3194,42 +3289,68 @@ func draw_rival() -> void:
 #   radius  14                (half the boss)
 #   attack  two phases        (vs three)
 #   reward  +4 score, +0.20 gauge, one guaranteed cache
-#   lifetime ~6..9 s
+#   combat window 22 s after arrival, followed by visible retreat
 func step_elite_clock(dt: float) -> void:
-	if elite_done or t < ELITE_AT:
+	if elite_done or t < elite_entry_time():
 		return
-	# Loop gate: the elite only appears on its designated loops. Appearing every
-	# loop made it a rhythm, and a rhythm is not an interruption.
-	if loop_n > elite_next_loop:
+	# Wait until the next eligible loop; start_elite advances it by two.
+	if loop_n < elite_next_loop:
 		return
 	if boss.is_empty():
 		start_elite()
 
 
+func elite_entry_time() -> float:
+	# Four eligible loops form a staggered cadence, separate from the deck.
+	var offsets := [-2.0, 2.0, -1.0, 4.0]
+	return ELITE_AT + float(offsets[maxi(0, int(loop_n / ELITE_EVERY) - 1) % offsets.size()])
+
+
 func start_elite() -> void:
+	stage_changed.emit()
+	_cancel_specials()
+	wave_pending.clear()
+	spawn_t = maxf(spawn_t, 1.0)
 	elite_done = true
 	elite_next_loop = loop_n + ELITE_EVERY
 	var hp := 55 + 18 * (loop_n - 1)
+	if elite_deck.is_empty():
+		elite_deck.assign([0, 1, 2, 3])
+		for i in range(elite_deck.size() - 1, 0, -1):
+			var j := rng.randi_range(0, i)
+			var swap := elite_deck[i]
+			elite_deck[i] = elite_deck[j]
+			elite_deck[j] = swap
+		if elite_deck.back() == elite_last:
+			var swap := elite_deck[0]
+			elite_deck[0] = elite_deck.back()
+			elite_deck[elite_deck.size() - 1] = swap
+	elite_last = elite_deck.pop_back()
 	boss = {
 		"p": Vector2(SPAWN_X + 14.0, H * 0.5),
 		"hp": hp, "max": hp,
 		"t": 0.0, "fire": 1.2, "tick": 0.8,
 		"r": 14.0, "hurt": 0.0, "ph": 0.0,
 		"is_elite": true,
+		"variant": elite_last,
 	}
 
 
 func step_elite(dt: float) -> void:
 	var bt: float = float(boss.t) + dt
 	boss.t = bt
-	# Hard lifetime. An elite that nobody kills withdraws instead of squatting in
-	# the boss slot forever 闂?that was the bug that kept the real boss from ever
-	# spawning.
-	if bt > ELITE_LIFE:
-		var leaving: Vector2 = boss.p
-		boss = {}
-		puff(leaving, 12)
-		rings.append({"c": leaving, "r0": 18.0, "r1": 2.0, "r": 18.0, "t": 0.0, "w": 1.0, "life": 0.30})
+	# Count the combat window after arrival; retreat is visible and still killable.
+	var stationed := bt - float(boss.get("station_t", bt))
+	if stationed > elite_combat_life():
+		var retreat_age := float(boss.get("retreat_age", 0.0))
+		var next_age := retreat_age + dt
+		boss.retreat_age = next_age
+		boss.p = (boss.p as Vector2) + Vector2(
+			_elite_retreat_distance(next_age) - _elite_retreat_distance(retreat_age), 0.0)
+		boss.hurt = maxf(0.0, float(boss.hurt) - dt)
+		if float(boss.p.x) > CULL_X_RIGHT + float(boss.r):
+			boss = {}
+			stage_changed.emit()
 		return
 	var bp: Vector2 = boss.p
 	var target := W * 0.70
@@ -3270,6 +3391,12 @@ func step_elite(dt: float) -> void:
 		rings.append({"c": sp, "r0": 5.0, "r1": 26.0, "r": 5.0, "t": 0.0, "w": 1.2, "life": 0.26})
 		rings.append({"c": sp, "r0": 3.0, "r1": 15.0, "r": 3.0, "t": 0.0, "w": 1.0, "life": 0.38})
 	var since := bt - float(boss.station_t)
+	if int(boss.get("variant", 0)) > 0:
+		for shot in EliteVariants.step(boss, player, dt):
+			eb_add(shot.p, shot.v, float(shot.r), str(shot.shape))
+		boss.hurt = maxf(0.0, float(boss.hurt) - dt)
+		step_chip(dt)
+		return
 	boss.p = Vector2(bp.x, H * 0.5 + sin(since * freq) * amp)
 
 	# The ring is a separate object; `arrive` is only the shell's own flash, and
@@ -3305,6 +3432,15 @@ func step_elite(dt: float) -> void:
 	step_chip(dt)
 
 
+func elite_combat_life() -> float:
+	return EliteVariants.COMBAT_LIFE if int(boss.get("variant", 0)) > 0 else ELITE_LIFE
+
+
+func _elite_retreat_distance(age: float) -> float:
+	var ramp := minf(age, 1.0)
+	return 35.0 * ramp + 25.0 * ramp * ramp + maxf(0.0, age - 1.0) * 85.0
+
+
 func elite_ring(n: int, sp: float) -> void:
 	var bp: Vector2 = boss.p
 	var base := float(boss.t) * 0.8
@@ -3326,13 +3462,25 @@ func elite_fan_sweep(n: int, sp: float) -> void:
 
 
 func beat_elite() -> void:
+	stage_changed.emit()
 	var bp: Vector2 = boss.p
+	var variant := int(boss.get("variant", 0))
 	boss = {}
-	score += 4
+	credit_kill(4)
 	gauge = minf(1.0, gauge + 0.20)
 	add_shake(3.2)
 	flash = 0.35
 	puff(bp, 26)
+	for i in (8 if variant > 0 else 0):
+		var direction := Vector2.from_angle(TAU * float(i) / 8.0)
+		if variant == 1:
+			direction = Vector2(direction.x * 0.4, direction.y * 1.5)
+		elif variant == 2:
+			direction = direction.orthogonal()
+		else:
+			direction = Vector2(direction.x * 1.6, direction.y * 0.4)
+		sparks.append({"p": bp + direction * 12.0, "v": direction * 65.0,
+			"life": 0.52, "max": 0.52, "g": 18.0, "w": 2, "core": false})
 	# Contrast with the boss: the boss bursts OUTWARD, the elite implodes. Two
 	# different death languages make the two tiers read as different events
 	# rather than the same event at two sizes.
@@ -3346,12 +3494,13 @@ func beat_elite() -> void:
 	spawn_t = maxf(spawn_t, 0.9)
 
 
-func eb_add(p: Vector2, v: Vector2, r: float) -> void:
+func eb_add(p: Vector2, v: Vector2, r: float, shape: String = "") -> void:
 	# Enemy rounds carry a short position history. One anchor was not enough:
 	# at 112px/s a bullet covers under 2px per frame, so a single stored point
 	# drew a 2px stub that vanished under the round's own disc. Four samples
 	# span ~8px, which is the shortest tail that reads as motion.
-	eb.append({"p": p, "v": v, "r": r, "life": 7.0, "trail": [p]})
+	eb.append({"p": p, "v": v, "r": r, "life": 7.0, "trail": [p],
+		"shape": shape if not shape.is_empty() else ("dart" if r < 2.0 else "diamond")})
 
 
 # ---- major contact ----------------------------------------------------------
@@ -3522,9 +3671,14 @@ func _report_blast() -> void:
 func step_foes(dt: float) -> void:
 	var i := foes.size() - 1
 	while i >= 0:
+		# Retaliation can remove several lower-index units during a hit.
+		if i >= foes.size():
+			i = foes.size() - 1
+			continue
 		var f := foes[i]
 		var k := int(f.kind)
 		var p: Vector2 = f.p
+		var previous := p
 
 		# Each craft rides a scripted weave; see the "ride the curve exactly"
 		# block below for why the body must not chase it.
@@ -3544,7 +3698,7 @@ func step_foes(dt: float) -> void:
 			if float(f.fire) <= 0.0 and target.x < W - 8.0:
 				f.fire = 1.75
 				eb_add(target, (player - target).normalized() * (112.0 + float(loop_n) * 4.0), 1.5)
-		else:
+		elif k == 2:
 			# y is driven by the weave on EVERY frame, including while the craft
 			# is still flying in.
 			#
@@ -3570,7 +3724,11 @@ func step_foes(dt: float) -> void:
 					f.spin = float(f.spin) + 0.72
 					for j in 3:
 						var a3 := float(f.spin) + TAU * float(j) / 3.0
-						eb_add(target, Vector2(98.0, 0.0).rotated(a3), 1.4)
+						eb_add(target, Vector2(98.0, 0.0).rotated(a3), 1.4, "seed")
+		elif k == Specials.Kind.DRONE or k == Specials.Kind.TURRET:
+			if not boss.is_empty() and int(f.state) != Specials.State.LEAVE:
+				Specials.cancel(f, true)
+			target = Specials.step(f, player, dt)
 
 		# Ride the curve exactly.
 		#
@@ -3611,6 +3769,7 @@ func step_foes(dt: float) -> void:
 				var dmg: int = maxi(1, int(b.get("dmg", 1)))
 				var pierce: int = int(b.get("pierce", 1)) - 1
 				f.hp = int(f.hp) - dmg
+				_mark_enemy_hit(f)
 				var impact: Vector2 = b.p as Vector2
 
 				# ---- hit feedback, per tier ---------------------------
@@ -3808,7 +3967,7 @@ func step_foes(dt: float) -> void:
 				# ONE body; FLAK rewards aiming at the MIDDLE of a group.
 				# Deliberately capped at FLAK_SHRED_MAX bodies and 1 damage
 				# each: a spray that wounds a cluster, never a second shell.
-					#
+				if w_kind == WEAPON_FLAK:
 					# Shred kills count exactly like direct kills (score, gauge,
 					# streak), the same rule the bomb splash already follows.
 					var shred_hits := 0
@@ -3823,15 +3982,19 @@ func step_foes(dt: float) -> void:
 							continue
 						shred_hits += 1
 						other2.hp = int(other2.hp) - FLAK_SHRED_DMG
+						_mark_enemy_hit(other2)
 						if int(other2.hp) <= 0:
-							score += 1
+							credit_kill()
 							gauge = minf(1.0, gauge + ERASE_GAIN)
 							var ok2: int = int(other2.kind)
 							note_kill(op2, 1.0 if ok2 == 0 else (1.5 if ok2 == 1 else 2.0))
 							puff_heavy(op2, 10)
 							rings.append({"c": op2, "r0": 3.0, "r1": 16.0, "r": 3.0,
 								"t": 0.0, "w": 1.0, "life": 0.26})
+							_special_departure(other2)
 							foes.remove_at(oi)
+							if oi < i:
+								i -= 1
 						else:
 							other2.hit_t = 0.12
 							puff(op2, 3)
@@ -3866,14 +4029,19 @@ func step_foes(dt: float) -> void:
 							continue
 						blast_hits += 1
 						other.hp = int(other.hp) - BOMB_BLAST_DMG
+						_mark_enemy_hit(other)
 						if int(other.hp) <= 0:
-							score += 1
+							credit_kill()
 							gauge = minf(1.0, gauge + ERASE_GAIN)
 							var ok: int = int(other.kind)
 							note_kill(op, 1.0 if ok == 0 else (1.5 if ok == 1 else 2.0))
 							puff_heavy(op, 14)
 							rings.append({"c": op, "r0": 4.0, "r1": 24.0, "r": 4.0, "t": 0.0, "w": 1.2, "life": 0.34})
+							_special_departure(other)
 							foes.remove_at(oi)
+							# Keep the direct target's index valid after splash.
+							if oi < i:
+								i -= 1
 						else:
 							other.hit_t = 0.16
 							puff(op, 4)
@@ -3884,7 +4052,7 @@ func step_foes(dt: float) -> void:
 					pb.remove_at(j2)
 
 				if int(f.hp) <= 0:
-					score += 1
+					credit_kill()
 					gauge = minf(1.0, gauge + ERASE_GAIN)
 					# Streak weight by craft class: shard 1, drift 1.5, coil 2,
 					# so a coil-heavy stretch also earns a cache without the
@@ -3900,11 +4068,28 @@ func step_foes(dt: float) -> void:
 					# wider shock. Two reads far heavier than one.
 					rings.append({"c": p, "r0": 2.0, "r1": 14.0, "r": 2.0, "t": 0.0, "w": 1.0, "life": 0.26})
 					rings.append({"c": p, "r0": 4.0, "r1": 34.0, "r": 4.0, "t": 0.0, "w": 1.6, "life": 0.48})
+					_special_departure(f)
 					foes.remove_at(i)
 					break
 			j2 -= 1
 
 		if i < foes.size() and foes[i] == f and int(f.hp) > 0:
+			if k == Specials.Kind.DRONE or k == Specials.Kind.TURRET:
+				# Resolve after player shots: killing the emitter cancels its attack.
+				if bool(f.expired) or not FRAME.grow(16.0).has_point(p):
+					if FRAME.has_point(p):
+						_special_departure(f, false)
+					foes.remove_at(i)
+				elif Specials.hits(f, player, previous):
+					f.spent = true
+					if k == Specials.Kind.DRONE:
+						_special_departure(f)
+						foes.remove_at(i)
+						puff(p, 8)
+					if invuln <= 0.0 and not dead:
+						hurt_player()
+				i -= 1
+				continue
 			# Cull one craft-radius past the frame edge, not 26 px past the
 			# raster edge. The old value let a craft run 17 px outside the
 			# printed border before it disappeared, which read as it sliding
@@ -4081,6 +4266,7 @@ func step_pb(dt: float) -> void:
 			var bdmg: int = maxi(1, int(b2.get("dmg", 1)))
 			var bwk: int = int(b2.get("wk", WEAPON_BASE))
 			bb.hp = int(bb.hp) - bdmg
+			_mark_enemy_hit(bb)
 
 			# ---- boss hit feedback ------------------------------------
 			# A boss that only flinched for 0.12 s with two debris specks read as
@@ -4158,7 +4344,7 @@ func step_pb(dt: float) -> void:
 func beat_boss() -> void:
 	var bp: Vector2 = boss.p
 	boss = {}
-	score += 12
+	credit_kill(12)
 	add_shake(4.5)
 	flash = 0.55
 	puff(bp, 44)
@@ -4193,6 +4379,8 @@ func beat_boss() -> void:
 # rival was beaten, `beat_rival` does NOT advance a second time. That asymmetry
 # is the whole point: the boss advances, the duel does not.
 func _advance_loop() -> void:
+	stage_changed.emit()
+	_cancel_specials()
 	loop_n += 1
 	# `boss_beat_this_loop` is deliberately NOT cleared here.
 	#
@@ -4206,13 +4394,19 @@ func _advance_loop() -> void:
 	rival_next_loop = loop_n + 1
 	# A new loop means the elite gets another appearance.
 	elite_done = false
-	t = BOSS_AT - maxf(18.0, 34.0 - float(loop_n) * 2.0)
+	t = 12.0
+	wave_clock = 0.0
+	wave_pending.clear()
+	wave_last = -1
+	wave_name = "solo"
+	special_next_at = 18.0 if loop_n >= 3 and not turret_introduced else 9.0
 	spawn_t = 1.5
 
 
 func step_eb(dt: float) -> void:
 	var i := eb.size() - 1
-	while i >= 0:
+	# Retaliation can kill the boss and clear this array during contact handling.
+	while i >= 0 and i < eb.size():
 		var b: Dictionary = eb[i]
 		# ---- lure homing ------------------------------------------------
 		# `lure_t` counts down while the round flies straight; when it hits
@@ -4255,7 +4449,6 @@ func step_eb(dt: float) -> void:
 				hq.append(Vector2(hpp.x + float(hs), hpp.y))
 			trim_trail(hq, _wake_span(int(b.get("wk", WEAPON_BASE)), true))
 			b.trail = hq
-			eb[i] = b
 			i -= 1
 			continue
 		# Trail history, trimmed by distance so the tail is the same length at
@@ -4275,7 +4468,6 @@ func step_eb(dt: float) -> void:
 			eb.remove_at(i)
 			i -= 1
 			continue
-		eb[i] = b
 		if invuln <= 0.0 and player.distance_to(p) <= float(b.r) + 2.0:
 			eb.remove_at(i)
 			# ---- per-tier damage ------------------------------------------
@@ -4407,6 +4599,9 @@ func _item_pick_fx(item: int, at: Vector2) -> void:
 # and the visual never drift: one line per item here, one function per item
 # there.
 func _grant_item(item: int, at: Vector2) -> void:
+	if item not in Passives.HUD_ORDER:
+		return
+	passive_pulse[item] = 0.65
 	match item:
 		ITEM_SHIELD:
 			# Refresh, do not stack: two shields is still two charges.
@@ -4417,7 +4612,42 @@ func _grant_item(item: int, at: Vector2) -> void:
 			# Fires IMMEDIATELY -- there is no held state. See the note above
 			# `item_thorn` for why a flag would have been a dead field.
 			trigger_barrage()
+			item_barrage_flash = 1.8
+		ITEM_MAGNET:
+			item_magnet = Passives.DURATION
+		ITEM_RELOADER:
+			item_reloader = Passives.DURATION
+		ITEM_CAPACITOR:
+			item_capacitor = Passives.CAPACITOR_KILLS
+		ITEM_PHASE:
+			item_phase = true
+		ITEM_PHOENIX:
+			item_phoenix = true
 	_item_pick_fx(item, at)
+	if item >= ITEM_MAGNET:
+		rings.append({"c": at, "r0": 4.0, "r1": 22.0 + int(Passives.RARITIES[item]) * 3.0,
+			"r": 4.0, "t": 0.0, "w": 1.0, "life": 0.3})
+
+
+func step_passives(dt: float) -> void:
+	item_magnet = maxf(0.0, item_magnet - dt)
+	item_reloader = maxf(0.0, item_reloader - dt)
+	item_barrage_flash = maxf(0.0, item_barrage_flash - dt)
+	for item in passive_pulse.size():
+		passive_pulse[item] = maxf(0.0, passive_pulse[item] - dt)
+
+
+func passive_fraction(item: int) -> float:
+	match item:
+		ITEM_SHIELD: return float(item_shield) / ITEM_SHIELD_CHARGES
+		ITEM_THORN: return 1.0 if item_thorn else 0.0
+		ITEM_BARRAGE: return item_barrage_flash / 1.8
+		ITEM_MAGNET: return item_magnet / Passives.DURATION
+		ITEM_RELOADER: return item_reloader / Passives.DURATION
+		ITEM_CAPACITOR: return float(item_capacitor) / Passives.CAPACITOR_KILLS
+		ITEM_PHASE: return 1.0 if item_phase else 0.0
+		ITEM_PHOENIX: return 1.0 if item_phoenix else 0.0
+	return 0.0
 
 
 # ---- passive items: THORN -------------------------------------------------
@@ -4454,6 +4684,7 @@ func _grant_item(item: int, at: Vector2) -> void:
 # it would not be worth taking a hit for.
 func trigger_thorn(at: Vector2) -> void:
 	item_thorn = false
+	passive_pulse[ITEM_THORN] = 0.45
 	# ---- the retaliation: NO RINGS AT ALL -----------------------------
 	#
 	# Rings were the wrong instrument here, and it took two failed captures to
@@ -4539,25 +4770,33 @@ func trigger_thorn(at: Vector2) -> void:
 			kept.append(f)
 			continue
 		f.hp = int(f.hp) - THORN_DMG
+		_mark_enemy_hit(f)
 		if int(f.hp) > 0:
 			kept.append(f)
 			f.hit_t = 0.20
 			puff(fp, 6)
 		else:
-			score += 1
+			credit_kill()
 			gauge = minf(1.0, gauge + ERASE_GAIN)
 			var ok: int = int(f.kind)
 			note_kill(fp, 1.0 if ok == 0 else (1.5 if ok == 1 else 2.0))
 			puff_heavy(fp, 16)
+			_special_departure(f)
 	foes = kept
 	if not boss.is_empty():
 		var bp: Vector2 = boss.p as Vector2
 		if at.distance_to(bp) <= THORN_RADIUS + float(boss.r) * 0.6:
 			boss.hp = int(boss.hp) - THORN_DMG
+			_mark_enemy_hit(boss)
 			boss.hurt = 0.28
 			boss.chip = {"p": bp, "t": 0.0, "r": 5.0}
 			if int(boss.hp) <= 0:
-				beat_boss()
+				if boss.has("is_elite"):
+					beat_elite()
+				elif boss.has("is_rival"):
+					beat_rival()
+				else:
+					beat_boss()
 
 
 # ---- passive items: BARRAGE ---------------------------------------------------
@@ -4709,7 +4948,8 @@ func trigger_barrage() -> void:
 		var ok: int = int(v2.kind)
 		note_kill(vp2, 1.0 if ok == 0 else (1.5 if ok == 1 else 2.0))
 		puff_heavy(vp2, 18)
-		score += 1
+		_special_departure(v2)
+		credit_kill()
 		gauge = minf(1.0, gauge + ERASE_GAIN)
 		killed.append(v2)
 	for v3 in killed:
@@ -4736,6 +4976,7 @@ func hurt_player() -> void:
 	# two EVENTS, not two frames of one event.
 	if item_shield > 0:
 		item_shield -= 1
+		passive_pulse[ITEM_SHIELD] = 0.4
 		invuln = 1.35
 		# ---- the shield taking a blow, not the hull ---------------------
 		# Same vocabulary as the pickup but inverted: the ring CONTRACTS
@@ -4761,6 +5002,15 @@ func hurt_player() -> void:
 				"g": 20.0, "w": 1, "core": false,
 			})
 		return
+	if item_phase:
+		item_phase = false
+		passive_pulse[ITEM_PHASE] = 0.65
+		invuln = 2.5
+		eb.clear()
+		rings.append({"c": player, "r0": 8.0, "r1": 96.0, "r": 8.0,
+			"t": 0.0, "w": 1.0, "life": 0.45})
+		add_shake(2.0, player)
+		return
 	# ---- THORN retaliates, but only AFTER the hit resolves -------------
 	# Called here rather than at the contact site so it fires for every damage
 	# source with one code path. The stagger inside trigger_thorn is what keeps
@@ -4769,6 +5019,20 @@ func hurt_player() -> void:
 	# event.
 	var thorns := item_thorn
 	hull -= 1
+	if hull <= 0 and item_phoenix:
+		item_phoenix = false
+		passive_pulse[ITEM_PHOENIX] = 0.85
+		hull = HULL_MAX
+		invuln = 3.0
+		heal_t = 0.0
+		heal_acc = 0.0
+		eb.clear()
+		rings.append({"c": player, "r0": 6.0, "r1": 72.0, "r": 6.0,
+			"t": 0.0, "w": 1.5, "life": 0.65})
+		if thorns:
+			trigger_thorn(player)
+		add_shake(3.0, player)
+		return
 	invuln = 1.35
 	# Impact punch: a heavy shake, a white flash, and a short hit-stop so the
 	# player feels the blow rather than just losing a tick.
@@ -4786,6 +5050,7 @@ func hurt_player() -> void:
 	var thorn_at := player
 	if hull <= 0:
 		dead = true
+		_cancel_specials()
 		dead_t = 0.0
 		add_shake(8.0, player)
 		hit_stop = 0.22
@@ -4846,6 +5111,7 @@ func do_erase() -> void:
 			"t": 0.0, "w": 0.6, "life": 0.18})
 	eb.clear()
 	# ---- the wipe ----------------------------------------------------------
+	_cancel_specials(false)
 	# SHORT AND FRONT-LOADED, deliberately.
 	#
 	# First version put the sweep on a 1.1 s life, on the theory that a long
@@ -4892,6 +5158,7 @@ func do_erase() -> void:
 	for f in foes:
 		var fp: Vector2 = f.p as Vector2
 		f.hp = int(f.hp) - 9
+		_mark_enemy_hit(f)
 		# ---- per-craft disintegrate -----------------------------------
 		# Staggered by x so the wave comes apart right-to-left, matching the
 		# direction the wipe travels. 0.0..0.55s across the field; a craft at
@@ -4913,7 +5180,7 @@ func do_erase() -> void:
 			rings.append({"c": fp, "r0": 3.0, "r1": 22.0, "r": 3.0,
 				"t": lag_x, "w": 1.2, "life": lag_x + 0.34})
 		else:
-			score += 1
+			credit_kill()
 			gauge = 0.0
 			# A bright core at the craft, then a heavy shell: two rings at two
 			# sizes is what reads as "that thing came apart" rather than "that
@@ -4928,9 +5195,11 @@ func do_erase() -> void:
 			rings.append({"c": fp, "r0": 5.0, "r1": 58.0, "r": 5.0,
 				"t": lag_x, "w": 1.8, "life": lag_x + 0.52})
 			puff_erase(fp, 26)
+			_special_departure(f)
 	foes = kept
 	if not boss.is_empty():
 		boss.hp = int(boss.hp) - 26
+		_mark_enemy_hit(boss)
 		boss.hurt = 0.30
 		boss.chip = {"p": boss.p as Vector2, "t": 0.0, "r": 6.0}
 		# The boss takes the wipe at its own position, not at the craft: a
@@ -4938,7 +5207,12 @@ func do_erase() -> void:
 		rings.append({"c": boss.p as Vector2, "r0": 8.0, "r1": 46.0, "r": 8.0,
 			"t": 0.0, "w": 2.0, "life": 0.44})
 		if int(boss.hp) <= 0:
-			beat_boss()
+			if boss.has("is_elite"):
+				beat_elite()
+			elif boss.has("is_rival"):
+				beat_rival()
+			else:
+				beat_boss()
 
 
 # Directional debris for the ERASE wipe.
@@ -5103,7 +5377,21 @@ func _mark_split(p: Vector2, across: Vector2, life_s: float) -> void:
 		})
 
 
+func _special_departure(foe: Dictionary, violent: bool = true) -> void:
+	if int(foe.kind) < Specials.Kind.DRONE or foe.get("remnant_queued", false):
+		return
+	foe.remnant_queued = true
+	if special_remnants.size() >= 8:
+		special_remnants.pop_front()
+	special_remnants.append(Specials.remnant(foe, violent))
+
+
 func step_sparks(dt: float) -> void:
+	for index in range(special_remnants.size() - 1, -1, -1):
+		var rem := special_remnants[index]
+		rem.age = float(rem.age) + dt
+		if float(rem.age) >= float(rem.life):
+			special_remnants.remove_at(index)
 	var i := sparks.size() - 1
 	while i >= 0:
 		var s: Dictionary = sparks[i]
@@ -5187,6 +5475,7 @@ func _draw() -> void:
 	draw_pb()
 	draw_foes()
 	draw_boss()
+	draw_enemy_health()
 	draw_eb()
 	draw_player()
 	draw_caches()
@@ -5982,161 +6271,9 @@ func draw_pb() -> void:
 # plate's body, which is the only way a 7px object gets a readable mass.
 # ---- passive item plates ---------------------------------------------------
 #
-# The three passives must be distinguishable from the seven weapon plates at
-# pickup speed, and the project already established (see the cache header) that
-# 7px CANNOT hold seven distinct outlines, let alone ten. The accepted solution
-# for weapons was: one shared 7x7 square, fingerprinted by interior paper seams.
-#
-# Adding three more seam patterns to that system would make ten fingerprints --
-# and the number of seams is already close to the discrimination limit
-# (1, 2, 3 lines and a cross is the whole vocabulary that survives at this size).
-#
-# So the passives invert the PLATE instead. A weapon plate is solid ink with
-# paper seams; a passive plate is solid PAPER with an INK outline and an ink
-# glyph inside. That is one bit of information, readable at a glance, that
-# costs no new shape vocabulary at all:
-#
-#     weapon  = dark square, light marks inside
-#     passive = light square, dark mark inside
-#
-# Polarity alone tells the player "this is not a gun" before any detail
-# resolves, which is exactly what a pickup has to do. And because the plate is
-# PAPER on a PAPER field, it ALSO needs the ink outline the old cache used to
-# carry -- without it the plate would dissolve into the cream ground, which is
-# the failure the previous redesign already paid for.
-# Row spans of the 7px disc, dy = -3..3 -> [x0, x1]. Hand-written, not derived
-# from Ink.ring: Ink.ring emits its two edge pixels at the poles as
-# (cx-ox)..(cx+1), which at rr=3 lands asymmetrically, and this plate has to be
-# mirror-symmetric or the three items do not read as one family.
-const ITEM_DISC_ROWS := [
-	[-1, 1],
-	[-2, 2],
-	[-3, 3],
-	[-3, 3],
-	[-3, 3],
-	[-2, 2],
-	[-1, 1],
-]
-
-
-# One horizontal run of the disc, given a row offset dy in -3..3 around `p`.
-func _item_disc_row(p: Vector2, dy: int, col: Color) -> void:
-	var half: Array = ITEM_DISC_ROWS[dy + 3]
-	var x0 := int(half[0])
-	var x1 := int(half[1])
-	draw_rect(Rect2(floorf(p.x + float(x0)), floorf(p.y + float(dy)),
-		float(x1 - x0 + 1), 1.0), col, true)
-
-
+# Light plates share their silhouettes and rarity pips with the passive HUD.
 func draw_item_plate(p: Vector2, item: int) -> void:
-	var at := Vector2(floorf(p.x), floorf(p.y))
-
-	# 1. Shadow: the same pseudo-3D every weapon plate carries, so the two
-	#    families still sit ON the field in the same way. SOOT at 0.45, one
-	#    pixel down-right -- no new tone.
-	for dy in range(-3, 4):
-		_item_disc_row(at + Vector2(1.0, 1.0), dy, Color(SOOT.r, SOOT.g, SOOT.b, 0.45))
-
-	# 2. Paper body: this IS the inversion. A weapon plate is ink; this is
-	#    paper. On the cream field a paper disc has no silhouette at all, which
-	#    is why step 3 (the ink ring) is the object and not a decoration.
-	for dy in range(-3, 4):
-		_item_disc_row(at, dy, PAPER)
-
-	# 3. Ink ring, 1px, hugging the disc exactly: leftmost and rightmost pixel
-	#    of every row, and the full span on the two pole rows (they have no
-	#    interior). This doubles as the paper liner's boundary: the mark drawn
-	#    in step 4 always has at least 1px of paper between itself and the
-	#    ring, so it reads on BOTH an ink craft and the paper field.
-	for dy in range(-3, 4):
-		var half: Array = ITEM_DISC_ROWS[dy + 3]
-		var x0 := int(half[0])
-		var x1 := int(half[1])
-		if dy == -3 or dy == 3:
-			draw_rect(Rect2(at.x + float(x0), at.y + float(dy),
-				float(x1 - x0 + 1), 1.0), INK, true)
-		else:
-			draw_rect(Rect2(at.x + float(x0), at.y + float(dy), 1.0, 1.0), INK, true)
-			draw_rect(Rect2(at.x + float(x1), at.y + float(dy), 1.0, 1.0), INK, true)
-
-	# 4. The item mark: INK on PAPER. Same geometry as the weapon seams would
-	#    still read differently, because polarity already separates the
-	#    families -- but the three here also avoid the seam grammar outright.
-	#
-	# The interior of the disc is only 5px wide on the middle rows and 3px on
-	# the near-pole rows, so every mark below is also a statement about what
-	# FITS: a 5px centred diagonal cannot exist (its ends are the ring), which
-	# is why THORN's slash is a 4px staircase displaced up-right, not a
-	# centred 45-degree line.
-	match item:
-		ITEM_SHIELD:
-			# Closed 3x3 ring: 8 pixels, empty centre. A ring is the only
-			# mark at this size that says "something surrounds something".
-			for dy in range(-1, 2):
-				for dx in range(-1, 2):
-					if dx == 0 and dy == 0:
-						continue
-					draw_rect(Rect2(at.x + float(dx), at.y + float(dy), 1.0, 1.0), INK, true)
-		ITEM_THORN:
-			# 4px diagonal staircase, (-1,-2) -> (2,1). Every pixel sits in
-			# paper interior: (-1,-2) and (2,1) are the extreme cells that
-			# still clear the ring by 1px. Sharp, and the only diagonal axis
-			# in the whole game.
-			for k in range(-1, 3):
-				draw_rect(Rect2(at.x + float(k), at.y + float(k - 1), 1.0, 1.0), INK, true)
-		_:
-			# BARRAGE: three detached dots in a VERTICAL column, at the
-			# centre. SWARM is three dots in a HORIZONTAL row in PAPER; this
-			# is the same count on the other axis in INK, and the column is
-			# literally the shape a barrage draws when it lands.
-			for dy in [-2, 0, 2]:
-				draw_rect(Rect2(at.x, at.y + float(dy), 1.0, 1.0), INK, true)
-
-	# 5. Outer glint. THE GLOW LIVES OUTSIDE THE PLATE, and that is a
-	#    constraint, not a preference.
-	#
-	#    A passive plate is PAPER-FILLED with an INK RING: the one thing in the
-	#    game with inverted polarity against a weapon plate. Touching the fill
-	#    or the ring at all would cost exactly that read -- a lit interior turns
-	#    the light square back into a dark square with a bright middle, which is
-	#    the weapon plate's grammar. So the glow has to sit in the 2px annulus
-	#    between the ring (r=3) and the pulse ring (r=7..8.5).
-	#
-	#    Shape: a four-armed star, 5px from the centre. Vertical arms CLEAR the
-	#    bloom gate; horizontal arms are FLASH, i.e. deliberately just under it.
-	#
-	#    Why mixed, and why only two gate pixels: a CORE ring would be 20+
-	#    pixels of pure light per plate and three plates would light the field
-	#    into haze. A single CORE pixel per plate would be a lamp, not a glint.
-	#    Two, opposite each other on the VERTICAL axis, is the shape the eye
-	#    reads as a star catching light -- and it is 2px of gate budget, so
-	#    four waiting pickups cost 8px total.
-	#
-	#    The horizontal pair is FLASH so the star still reads as four-pointed
-	#    while contributing nothing to the glow chain: the same trick that
-	#    keeps every enemy hit from blooming, used here for the arms.
-	#
-	#    Pulsed rather than constant: `Ink.now()` is the project's 8fps quantised
-	#    clock, so the glint ticks in whole pixels at the same rate as the hand-
-	#    drawn boil and never looks like a modern additive shader stuck on top.
-	var gph := Ink.now()
-	var gk := 0.5 + 0.5 * sin(gph * 2.1)
-	# Vertical arms: the gate pair. Present whenever the pulse is up, so the
-	# glint blinks rather than dims -- a dimmed CORE pixel would drop UNDER the
-	# gate and the two states would be "lit" and "not lit" anyway, just less
-	# legibly.
-	if gk > 0.34:
-		draw_rect(Rect2(at.x, at.y - 5.0, 1.0, 1.0), CORE, true)
-		draw_rect(Rect2(at.x, at.y + 5.0, 1.0, 1.0), CORE, true)
-	var fa := Color(FLASH.r, FLASH.g, FLASH.b, 0.55 + gk * 0.45)
-	draw_rect(Rect2(at.x - 5.0, at.y, 1.0, 1.0), fa, true)
-	draw_rect(Rect2(at.x + 5.0, at.y, 1.0, 1.0), fa, true)
-	# Inner echo: two FLASH pixels hugging the ring at r=4 on the SAME vertical
-	# axis. Without them the two CORE pixels float with no connection to the
-	# plate; with them the light has a path from the plate edge outward, which
-	# is what makes it read as emitted rather than pasted.
-	draw_rect(Rect2(at.x, at.y - 4.0, 1.0, 1.0), Color(FLASH.r, FLASH.g, FLASH.b, 0.42), true)
-	draw_rect(Rect2(at.x, at.y + 4.0, 1.0, 1.0), Color(FLASH.r, FLASH.g, FLASH.b, 0.42), true)
+	Passives.draw_pickup(self, p, item)
 
 
 func draw_caches() -> void:
@@ -6176,6 +6313,7 @@ func draw_caches() -> void:
 		# its ink is slightly lifted toward the page -- one value, no gradient,
 		# which keeps it distinguishable from a hostile silhouette without
 		# introducing a third tone that the CRT would turn into a band.
+		Ink.paper_edge(self, pts)
 		Ink.fill_poly(self, pts, Color(INK.r, INK.g, INK.b, 0.92))
 
 		# Interior seams: the tier's actual mark. One pixel per step, drawn at
@@ -6321,9 +6459,9 @@ func _poly_around(p: Vector2, rel: Array) -> PackedVector2Array:
 
 
 func draw_eb() -> void:
-	for b in eb:
+	for bullet_index in eb.size():
+		var b: Dictionary = eb[bullet_index]
 		var p: Vector2 = b.p
-		var rr := float(b.r)
 		var tr: Array = b.get("trail", [])
 
 		# Hostile wake: built by the same helper as friendly fire, only hotter
@@ -6353,70 +6491,13 @@ func draw_eb() -> void:
 		draw_streak(p, tr, float(hcfg.get("ink", 0.60)), float(hcfg.get("paper", 0.90)),
 			hcfg)
 
-		# ---- the round itself -------------------------------------------
-		# The first version drew a PAPER pad exactly 2px larger than the pellet
-		# and then the pellet in full INK. Against the boss 闁?also a full INK
-		# disc 闁?those two shapes merged into one black mass and the volley read
-		# as decoration on the boss rather than as incoming fire. Three changes:
-		#
-		#   1. the pad is BIGGER (rr*2 + 4 instead of +2), so every round carries
-		#      a visible cream ring at its edge;
-		#   2. the pellet is INK but the pad is pure PAPER at full alpha, giving
-		#      a hard light/dark ring instead of a soft one;
-		#   3. a 1px hot centre is dropped in for rr >= 3 so the round has an
-		#      interior reference point when several overlap.
-		#
-		# Everything is placed from ONE integer anchor: packing the pad and the
-		# pellet separately let floor() push them apart by a pixel, which at 3x
-		# upscale reads as a white square with a dark notch in one corner.
-		var body := maxf(1.0, floorf(rr * 2.0) + 1.0)
-		var pad := body + 4.0
-		var ox := floorf(p.x - pad * 0.5)
-		var oy := floorf(p.y - pad * 0.5)
-		# Paper pad: this is what separates the round from the BOSS disc.
-		#
-		# Over cream paper the pad is invisible (same colour), and that is fine 闁?		# there the dark pellet already reads. The pad earns its place exactly
-		# where it was needed: over the ink disc, where a black pellet on black
-		# ground had no edge at all and the volley looked like decoration.
-		draw_rect(Rect2(ox, oy, pad, pad), PAPER, true)
-		var bx := ox + 2.0
-		var by := oy + 2.0
-		# ---- per-tier hostile body --------------------------------------
-		# The twin now fires more than one tier, so a hostile round has to say
-		# WHICH tier it is, the same way the player's rounds do. Same palette,
-		# same "no colours" rule: shape only.
-		#
-		#   BASE/MG  a square pellet, as it always was
-		#   BOMB     a round shell, visibly larger and rounder
-		#
-		# Nothing else exists here -- the twin is limited to three tiers (see
-		# _cycle_rival_tier), so this is the whole space.
-		var wk := int(b.get("wk", WEAPON_BASE))
-		if wk == WEAPON_BOMB:
-			# A disc rather than a square, so the shell reads as mass. The
-			# paper pad already separates it from the boss; the round body is
-			# what separates it from a tracer.
-			Ink.disc(self, Vector2(bx + body * 0.5, by + body * 0.5), rr, INK)
-			# An equatorial paper seam, one row: the same "cylinder lit from
-			# above" device the player's shell uses, so the two BOMB rounds
-			# read as the same ammunition seen from opposite sides.
-			draw_rect(Rect2(bx, floorf(by + body * 0.5), body, 1.0),
-				Color(PAPER.r, PAPER.g, PAPER.b, 0.55), true)
-			draw_rect(Rect2(bx + body * 0.5 - 1.0, by + body * 0.5 - 1.0, 1.0, 1.0),
-				FLASH, true)
-		elif rr < 2.0:
-			draw_rect(Rect2(bx, by, body, body), INK, true)
-		else:
-			Ink.disc(self, Vector2(bx + body * 0.5, by + body * 0.5), rr, INK)
-			if rr >= 3.0:
-				# Interior point, NOT a bloom core: FLASH sits under the gate so
-				# a screen full of bullets never lights the glow pass.
-				var cs := maxf(1.0, floorf(rr * 0.5))
-				draw_rect(Rect2(bx + body * 0.5 - cs * 0.5, by + body * 0.5 - cs * 0.5, cs, cs),
-					FLASH, true)
+		HostileProjectiles.draw(self, b, bullet_index < 12,
+			hwk == WEAPON_BOMB, hwk == WEAPON_MG)
 
 
 func draw_foes() -> void:
+	for rem in special_remnants:
+		Specials.draw_remnant(self, rem)
 	for f in foes:
 		var p: Vector2 = f.p
 		var k := int(f.kind)
@@ -6434,15 +6515,14 @@ func draw_foes() -> void:
 		# the cheapest cue that a craft is flying rather than being dragged.
 		var lean := clampf(float(f.get("vy", 0.0)) / 70.0, -1.0, 1.0) * 0.34
 
-		# Paper halo first, so silhouettes survive the dark moon.
-		Ink.disc(self, p, s + 1.5, Color(PAPER.r, PAPER.g, PAPER.b, 0.90))
 		if k == 0:
 			_draw_shard(p, s, lean, seed)
 		elif k == 1:
 			_draw_drift(p, s, lean, seed, float(f.get("fire", 9.0)))
-		else:
+		elif k == 2:
 			_draw_coil(p, s, lean, float(f.spin), float(f.get("fire", 9.0)))
-		pips(p + Vector2(0.0, s + 4.0), int(f.hp))
+		elif k == Specials.Kind.DRONE or k == Specials.Kind.TURRET:
+			Specials.draw(self, f)
 
 		# ---- hit flash -----------------------------------------------------
 		# A soft lift stamped over the craft, fading out over the hit window.
@@ -6508,51 +6588,11 @@ const LIGHT := Vector2(-0.7071, -0.7071)
 # rotate with the craft and the highlight would follow the ship around, which
 # looks like the light source is attached to the enemy.
 func _facet_body(pts: PackedVector2Array, body_col: Color, halo := 1.0) -> void:
-	var n := pts.size()
-	if n < 3:
+	if pts.size() < 3:
 		return
-	var c := Vector2.ZERO
-	for v in pts:
-		c += v
-	c /= float(n)
-
-	# ---- HOW THICK THE OUTLINE IS -------------------------------------------
-	# Every hostile is now drawn with the SAME treatment as the player craft:
-	# a filled ink body and ONE paper hairline, no bevel, no per-edge colouring.
-	# The reference point is the player, and matching it is the whole request.
-	#
-	# What went wrong before, in order, because it is worth not repeating:
-	#
-	#   1. per-edge colouring on a 10px body put a 1px rim on each of four sides,
-	#      so the rim became the object and the ink core vanished;
-	#   2. the "small body" variant tried to keep the rim ink and only light the
-	#      sun-facing edges, which still left a doubled contour 鈥?the silhouette
-	#      read as a line drawn ROUND a shape rather than as the shape itself;
-	#   3. the MUTE/SOOT bevel on the big bodies (boss, elite) added a second and
-	#      third value to the rim, which is what "澶お澶矖" was seeing: at 3x with
-	#      CRT bleed a 1px crescent in a third tone reads as a 2-3px band.
-	#
-	# The player has none of this. It is: paper halo, solid ink, one paper seam.
-	# That is what every hostile gets now. Depth is carried by FORM (the shapes
-	# below are faceted and asymmetric) and by the halo, not by rim thickness.
-	#
-	# `halo` scales the paper padding; it is the only per-craft difference.
+	# Every body gets the same hard 1px contour, independent of collision radius.
 	if halo > 0.0:
-		# The expansion factor must come from the shape's own size, not from
-		# whatever vertex happens to be index 0 鈥?using pts[0] made the halo
-		# silently wider or narrower depending on vertex order, which is the
-		# kind of per-shape drift that is impossible to eyeball.
-		var mean_r := 0.0
-		for v in pts:
-			mean_r += v.distance_to(c)
-		mean_r = maxf(1.0, mean_r / float(n))
-		var k := 1.0 + halo / mean_r
-		var out := PackedVector2Array()
-		for v in pts:
-			out.append(c + (v - c) * k)
-		Ink.fill_poly(self, out, Color(PAPER.r, PAPER.g, PAPER.b, 0.92))
-
-	# Body: one solid fill, exactly like the player's hull.
+		Ink.paper_edge(self, pts)
 	Ink.fill_poly(self, pts, body_col)
 
 
@@ -6707,13 +6747,62 @@ func weave_wave(ph: float) -> float:
 func weave_slope(ph: float) -> float:
 	return cos(ph)
 
-func pips(at: Vector2, hp: int) -> void:
-	var n := mini(hp, 6)
-	if n <= 0:
+func _mark_enemy_hit(enemy: Dictionary) -> void:
+	enemy.health_from = enemy_health_visibility(enemy)
+	enemy.health_start = health_clock
+	enemy.health_until = health_clock + 2.0
+
+
+func enemy_health_visibility(enemy: Dictionary) -> float:
+	var remaining := float(enemy.get("health_until", -1.0)) - health_clock
+	if remaining <= 0.0:
+		return 0.0
+	var reveal := smoothstep(0.0, 0.16, health_clock - float(enemy.get("health_start", health_clock)))
+	return lerpf(float(enemy.get("health_from", 0.0)), 1.0, reveal) * smoothstep(0.0, 0.30, remaining)
+
+
+func enemy_health_rect(enemy: Dictionary, major: bool = false) -> Rect2:
+	var p: Vector2 = enemy.p
+	var extent := float(enemy.r)
+	var width := 12.0
+	if major:
+		width = 24.0 if enemy.has("is_elite") or enemy.has("is_rival") else 32.0
+		if int(enemy.get("variant", 0)) > 0:
+			extent = 27.0
+	elif int(enemy.get("kind", 0)) >= Specials.Kind.DRONE:
+		width = 14.0
+	var y := p.y - extent - 8.0
+	if y < 18.0:
+		y = p.y + extent + 5.0
+	return Rect2(Vector2(clampf(p.x - width * 0.5, 15.0, W - 15.0 - width),
+		clampf(y, 16.0, H - 16.0)).floor(), Vector2(width, 2))
+
+
+func _draw_enemy_health(enemy: Dictionary, major: bool = false) -> void:
+	var visibility := enemy_health_visibility(enemy)
+	if visibility <= 0.0 or int(enemy.hp) <= 0:
 		return
-	var x0 := floorf(at.x - float(n - 1) * 1.5)
-	for i in n:
-		draw_rect(Rect2(x0 + float(i) * 3.0, at.y, 1.0, 2.0), INK, true)
+	var rect := enemy_health_rect(enemy, major)
+	var width := maxf(2.0, floorf(rect.size.x * lerpf(0.25, 1.0, visibility)))
+	var position := (rect.position + Vector2((rect.size.x - width) * 0.5,
+		floorf((1.0 - visibility) * 2.0))).floor()
+	var track := Rect2(position, Vector2(width, 1))
+	# A single paper underscoring keeps the hairline legible on the dark moon.
+	draw_rect(Rect2(position + Vector2.DOWN, track.size), Color(PAPER, visibility * 0.70))
+	# Sparse sources light the white hairline through the existing bloom pass.
+	for pixel in range(3, int(width), 8):
+		draw_rect(Rect2(position + Vector2(pixel, 1), Vector2.ONE), Color(CORE, visibility))
+	draw_rect(track, Color(SOOT, visibility * 0.30))
+	var fraction := clampf(float(enemy.hp) / maxf(1.0, float(enemy.max)), 0.0, 1.0)
+	track.size.x = maxf(1.0, floorf(width * fraction))
+	draw_rect(track, Color(INK, visibility * 0.90))
+
+
+func draw_enemy_health() -> void:
+	for enemy in foes:
+		_draw_enemy_health(enemy)
+	if not boss.is_empty():
+		_draw_enemy_health(boss, true)
 
 
 func draw_boss() -> void:
@@ -6809,18 +6898,6 @@ func draw_boss() -> void:
 			if cr > 0.5:
 				Ink.disc(self, cp, cr, PAPER)
 
-	# HP: a curved tick run hugging the crown. Dots follow the circle, so nothing
-	# in this silhouette is a straight line.
-	var frac := float(boss.hp) / float(boss.max)
-	var steps := 26
-	var lit := int(frac * float(steps))
-	for i in steps:
-		var a2 := PI + 0.36 + (PI - 0.72) * float(i) / float(steps - 1)
-		var q := p + Vector2(cos(a2), sin(a2)) * (rad + 10.0)
-		if i < lit:
-			draw_rect(Rect2(floorf(q.x), floorf(q.y), 2.0, 2.0), INK, true)
-		else:
-			draw_rect(Rect2(floorf(q.x), floorf(q.y), 1.0, 1.0), Color(INK.r, INK.g, INK.b, 0.22), true)
 
 
 # ---- elite silhouette --------------------------------------------------------
@@ -6836,6 +6913,9 @@ func draw_boss() -> void:
 # sign; the same diamond split into four faces with four different edge colours
 # is a solid, and that is the pseudo-3D the whole pass is about.
 func draw_elite() -> void:
+	if int(boss.get("variant", 0)) > 0:
+		EliteVariants.draw(self, boss)
+		return
 	var p: Vector2 = boss.p
 	var rad := float(boss.r)
 	var hurt := float(boss.hurt)
@@ -6894,17 +6974,6 @@ func draw_elite() -> void:
 			Ink.ring(self, p, br + 2.5 + open * 2.0, 1.0,
 				Color(INK.r, INK.g, INK.b, 0.18 + open * 0.45))
 
-	# Health: same curved tick run as the boss, at a smaller radius so the two
-	# healths never overlap when both exist across a loop.
-	var steps := 14
-	var lit := int(frac * float(steps))
-	for i in steps:
-		var a2 := PI + 0.30 + (PI - 0.60) * float(i) / float(steps - 1)
-		var q := p + Vector2(cos(a2), sin(a2)) * (br + 8.0)
-		if i < lit:
-			draw_rect(Rect2(floorf(q.x), floorf(q.y), 1.0, 2.0), INK, true)
-		else:
-			draw_rect(Rect2(floorf(q.x), floorf(q.y), 1.0, 1.0), Color(INK.r, INK.g, INK.b, 0.20), true)
 
 
 # Six-vertex crystal: left, right, top, bottom, plus two concave shoulders.
@@ -7016,7 +7085,7 @@ func draw_player() -> void:
 	# The halo stays at full alpha during the blink: it is what holds the craft's
 	# POSITION on screen while the body itself fades, so the player never loses
 	# track of where they were knocked to.
-	Ink.fill_poly(self, _hull_xf(p, body_ang, 1.15), Color(PAPER.r, PAPER.g, PAPER.b, 0.92))
+	Ink.paper_edge(self, _hull_xf(p, body_ang))
 
 	Ink.fill_poly(self, _hull_xf(p, body_ang), Color(INK.r, INK.g, INK.b, blink))
 
@@ -7057,11 +7126,12 @@ func draw_player() -> void:
 	# visible half of the alternation: the flash jumps between the dorsal and the
 	# ventral root, so the twin-gun rhythm is legible on the hull itself.
 	if shot_pulse > 0.02:
-		var side := -1.0 if cannon == 0 else 1.0
+		var side := (-1.0 if cannon == 0 else 1.0) if weapon in [WEAPON_BASE, WEAPON_MG] else 1.0
 		var mz := wing_muzzle(p, side)
-		var mh := 1.0 + shot_pulse * 2.0
-		draw_rect(Rect2(mz.x, mz.y - mh * 0.5, 2.0 + shot_pulse * 2.0, mh),
-			Color(INK.r, INK.g, INK.b, 0.30 + shot_pulse * 0.55), true)
+		var length := (3.0 if weapon in [WEAPON_BASE, WEAPON_MG] else 5.0) * shot_pulse
+		draw_colored_polygon(PackedVector2Array([mz + Vector2(0, -1),
+			mz + Vector2(2 + length, 0), mz + Vector2(0, 1)]),
+			Color(INK, 0.35 + shot_pulse * 0.55))
 
 	# ---- impact punch ----------------------------------------------------
 	if hit_t > 0.0:
@@ -7385,16 +7455,9 @@ func draw_hud() -> void:
 
 	# ---- 2. kills: "K NN" in the 5x7 pixel font -------------------------
 	#
-	# Replaces the tally the plate used before. The tally was elegant and
-	# completely unreadable in a live game: to know the score you had to count
-	# slash-crossed groups, which nobody does while dodging. A label plus a
-	# numeral answers "how many" in one glance.
-	#
-	# The string is drawn left-anchored on the rail and zero-padded to two
-	# digits, so the readout never changes width as the count crosses 10 鈥?a
-	# readout that reflows mid-run pulls the eye for no reason.
-	var kills := mini(score, 99)
-	var kill_label := "K %02d" % kills
+	# K counts bodies independently of weighted elite/boss score rewards.
+	# Two digits minimum; larger counts grow rightward into free space.
+	var kill_label := "K %02d" % kill_count
 	var kill_pos := Vector2(rail_x + 6.0, rail_y + 9.0)
 	Ink.text(self, kill_pos, kill_label, INK, 2.0)
 
@@ -7485,63 +7548,14 @@ func draw_hud() -> void:
 			draw_rect(Rect2(hx, hyy, floorf(hw * hf), 1.0), Color(INK.r, INK.g, INK.b, 0.55), true)
 			draw_rect(Rect2(hx, hyy, hw, 1.0), Color(INK.r, INK.g, INK.b, 0.14), true)
 
-	# ---- 3c. passive item state -----------------------------------------
-	#
-	# Shield and thorn are PERSISTENT state and have to be visible without
-	# the player looking for them; the barrage has no state and is absent by
-	# design (see the note on `item_shield`).
-	#
-	# Both markers live on the heal pip's row and grow RIGHTWARD from the
-	# heart row's own left edge, so the whole left column reads as one block:
-	# kills, hull, heal progress, then what is protecting the hull.
-	#
-	# ---- why two SHAPES and not two colours ------------------------------
-	# There are no colours. A shield charge and an armed thorn therefore have
-	# to differ in geometry, and they differ in the same vocabulary the pickup
-	# plates use -- a horizontal bar versus a vertical stack:
-	#
-	#   shield   1px bar per charge, drawn SIDE BY SIDE (a wall)
-	#   thorn    a small vertical tick, standing alone at the row's right
-	#
-	# Both are at 2x-equivalent weight (2px strokes) because this corner is
-	# where `focus_field` blurs hardest; at 1px they would be eaten to grey.
-	# `rail_y + 48`, NOT +42: the heal pip already owns that row, and the first
-	# draft drew the shield bars straight through it. Two readouts sharing a
-	# baseline is a rule everywhere else on this plate; here they are different
-	# KINDS of information (recovery vs protection), so they get separate rows.
-	var item_y := rail_y + 49.0
-	var item_x := rail_x + 7.0
-	# ---- why TWO fixed slots and not "only the ones you still hold" -------
-	# The first version drew `for k in item_shield`, i.e. only the remaining
-	# charges. That makes the row SHORTEN when a charge is spent, and a row
-	# that changes shape is a different object -- the player reads "something
-	# else appeared" rather than "a charge went away". Both slots are
-	# therefore always drawn, and a spent charge is the SAME 3x2 cell at
-	# alpha 0.13, which is the magazine-cell vocabulary: dim means empty, and
-	# it is the same shape as full.
-	#
-	# ---- why 6px pitch and not 4 -----------------------------------------
-	# At 4px pitch a 3px cell leaves a 1px gap. Under 3x CRT bleed plus
-	# focus_field at its strongest in this corner, a 1px gap is smeared into
-	# nothing and the two cells merge into one 10px bar -- which reads as
-	# "one" rather than "two". 6px pitch leaves a 3px gap that survives.
-	#
-	# ---- why rail_y + 49 and not +42 or +48 -------------------------------
-	# The heal pip owns rail_y + 42 exactly (one 1px rule). +48 put the thorn
-	# tick's top at rail_y + 44, one row from the pip, and under 3x bleed the
-	# two read as one object. +49 leaves rows 43-44 as real paper.
-	#
-	# Shield charges: BOTH slots always drawn, dim for spent.
-	for k in ITEM_SHIELD_CHARGES:
-		var a := 1.0 if k < item_shield else 0.13
-		draw_rect(Rect2(floorf(item_x + float(k) * 6.0), floorf(item_y), 3.0, 2.0),
-			Color(INK.r, INK.g, INK.b, a), true)
-	# Thorn: a vertical tick, 2 wide, 6 tall, standing to the RIGHT of the
-	# widest the shield row can ever be (slot 1 ends at item_x + 9, this
-	# starts at item_x + 12 -> 3px of air, so both can be present at once).
-	var ta := 1.0 if item_thorn else 0.13
-	draw_rect(Rect2(floorf(item_x + 12.0), floorf(item_y - 4.0), 2.0, 6.0),
-		Color(INK.r, INK.g, INK.b, ta), true)
+	# Four passive icons share the weapon cluster's bottom baseline.
+	for slot in Passives.HUD_ORDER.size():
+		var item: int = Passives.HUD_ORDER[slot]
+		var origin := passive_hud_origin(slot)
+		var fraction := passive_fraction(item)
+		var pulse := passive_pulse[item]
+		var opacity := 1.0 if fraction > 0.0 else lerpf(0.32, 1.0, clampf(pulse * 2, 0, 1))
+		Passives.draw_icon(self, origin, item, fraction, opacity, true)
 	# ---- probe readout ---------------------------------------------------
 	# Printed only when a probe asked for it, and only once, so a normal run
 	# never pays for it. This is the "可读中间量" the project requires of every
@@ -7783,47 +7797,12 @@ func draw_hud() -> void:
 			Color(INK.r, INK.g, INK.b, 0.42), true)
 
 	# ---- C. reload ring --------------------------------------------------
-	# Both states are the SAME drawing at different values, so there is nothing
-	# to snap between:
-	#   radius  ready 5.0, contracts to 4.1 at the start of a reload and opens
-	#           back out 鈥?the ring physically closes and refills
-	#   dots    16 dots, unlit at low alpha; a reload lights them one by one,
-	#           so "ready" is simply "all 16 lit"
-	#   core    grows from nothing, so the first frame of a reload is visibly
-	#           different from the last frame of ready
-	#
-	# Radius 5.0 鈥?its original size, restored.
-	#
-	# It was briefly shrunk to 3.0 on the assumption that "the box is too big"
-	# referred to this ring. It did not: the ring was fine, and shrinking it to
-	# the height of the cells made the reload progress unreadable 鈥?16 dots on a
-	# 3px circle step 1.18px apart and the arc reads as a texture, not a sweep.
-	#
-	# 5.0 is also the radius where the dot pitch is 1.96px, so consecutive dots
-	# land on clearly distinct pixels and the closing sweep is countable. Left at
-	# its original size and CENTRED on the cells' band rather than on the old
-	# `top`, so it is still aligned with the rest of the row.
+	# A fixed-radius antialiased arc keeps the silhouette stable; only the
+	# clockwise sweep moves. Progress remains tied to the actual ammo timer.
 	var rx := mx0 + 21.0 + 14.0
 	var ry2 := cell_top + cell_h * 0.5
 	var prog := clampf(reload_t / maxf(reload_len, 0.001), 0.0, 1.0) if reloading else 1.0
-	var rr := 5.0 - (1.0 - prog) * 0.9
-	var segs := 16
-	var lit_segs := int(round(prog * float(segs)))
-	for i in segs:
-		var a := -PI * 0.5 + TAU * float(i) / float(segs)
-		var q := Vector2(floorf(rx + cos(a) * rr), floorf(ry2 + sin(a) * rr))
-		if i < lit_segs:
-			draw_rect(Rect2(q.x, q.y, 1.0, 1.0), INK, true)
-		else:
-			draw_rect(Rect2(q.x, q.y, 1.0, 1.0), Color(INK.r, INK.g, INK.b, 0.10), true)
-	# Core: the interior fill that carries progress when the hairline arc alone
-	# is too thin to read from the corner of the eye.
-	if prog < 1.0:
-		if prog > 0.08:
-			Ink.disc(self, Vector2(rx, ry2), 2.6 * prog, Color(INK.r, INK.g, INK.b, 0.55))
-	else:
-		draw_rect(Rect2(floorf(rx), floorf(ry2), 1.0, 1.0),
-			Color(INK.r, INK.g, INK.b, 0.45 + absf(sin(t * 3.0)) * 0.10), true)
+	_draw_reload_ring(Vector2(rx, ry2), prog)
 
 	# Tier letter: right of the ring, on the cells' baseline.
 	# Only for specials 鈥?the base gun has no name to announce, and a glyph that
@@ -7838,15 +7817,27 @@ func draw_hud() -> void:
 	# gets.
 	for i in mini(loop_n - 1, 8):
 		var x := rail_r - HUD_STEP - float(i) * HUD_STEP
-		draw_rect(Rect2(x, rail_b - HUD_INSET, 1.0, gh), INK, true)
+		draw_rect(Rect2(x, rail_b - HUD_INSET - 20.0, 1.0, gh), INK, true)
 
 
-# One L-shaped bracket at a corner, `sx`/`sy` pointing along the two arms.
-#
-# Drawn as two 1px runs that meet exactly, so the corner is one continuous
-# hairline. Each arm is inset by 0 (the corner is shared) and the arms are drawn
-# from the corner outward, which keeps the joint pixel solid instead of leaving
-# a hole where two rectangles would overlap.
+func passive_hud_origin(slot: int) -> Vector2:
+	var rail_r := FRAME.end.x - HUD_RAIL
+	var rail_b := FRAME.end.y - HUD_RAIL
+	return Vector2(rail_r - 60.0 + slot * 15.0, rail_b - HUD_INSET - 4.0)
+
+
+func _draw_reload_ring(center: Vector2, progress: float) -> void:
+	var p := center.floor() + Vector2(0.5, 0.5)
+	var sweep := clampf(progress, 0.0, 1.0)
+	draw_arc(p, 4.5, -PI * 0.5, TAU - PI * 0.5, 64, Color(INK, 0.16), 1.0, true)
+	if sweep > 0.0:
+		draw_arc(p, 4.5, -PI * 0.5, -PI * 0.5 + TAU * sweep,
+			maxi(2, int(ceilf(64 * sweep))), INK, 1.0, true)
+	if sweep >= 1.0:
+		draw_rect(Rect2(p - Vector2(0.5, 0.5), Vector2.ONE), Color(INK, 0.5))
+
+
+# Two joined hairlines form one corner bracket.
 func _corner_bracket(c: Vector2, sx: float, sy: float, arm: float, col: Color) -> void:
 	var x0 := floorf(c.x) if sx > 0.0 else floorf(c.x - arm)
 	var y0 := floorf(c.y) if sy > 0.0 else floorf(c.y - arm)

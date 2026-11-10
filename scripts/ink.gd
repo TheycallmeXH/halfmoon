@@ -78,6 +78,25 @@ static func fill_poly(ci: CanvasItem, pts: PackedVector2Array, col: Color) -> vo
 		ci.draw_colored_polygon(pts, col)
 
 
+# A crisp one-pixel rim with two faint outer steps, following the actual hull.
+# Draw the body afterwards so the wash never covers its interior detail.
+static func paper_edge(ci: CanvasItem, pts: PackedVector2Array) -> void:
+	if pts.size() < 3:
+		return
+	for band in [Vector2(3.0, 0.045), Vector2(2.0, 0.14)]:
+		for contour in Geometry2D.offset_polygon(pts, band.x, Geometry2D.JOIN_ROUND):
+			var pixels := PackedVector2Array()
+			for point in contour:
+				pixels.append(point.floor())
+			ci.draw_colored_polygon(pixels, Color(PAPER, band.y))
+	for offset in [Vector2(-1, -1), Vector2(0, -1), Vector2(1, -1),
+			Vector2(-1, 0), Vector2(1, 0), Vector2(-1, 1), Vector2(0, 1), Vector2(1, 1)]:
+		var shifted := PackedVector2Array()
+		for point in pts:
+			shifted.append(point + offset)
+		ci.draw_colored_polygon(shifted, PAPER)
+
+
 static func dot(ci: CanvasItem, p: Vector2, r: float, col := INK) -> void:
 	ci.draw_rect(Rect2(px(p.x - r), px(p.y - r), maxf(1.0, floorf(r * 2.0)), maxf(1.0, floorf(r * 2.0))), col, true)
 
@@ -244,6 +263,9 @@ static func screen_dots(ci: CanvasItem, c: Vector2, r: float, step := 3.0, col :
 # turning body; a fixed lattice reads as a printed sticker.
 static func screen_dots_rot(ci: CanvasItem, c: Vector2, r: float, step := 3.0, col := INK, level := 8, spin := 0.0) -> void:
 	var rr := floorf(r)
+	if rr < 1.0:
+		return
+	var inner_sq := (rr - 1.0) * (rr - 1.0)
 	var cy := int(px(c.y))
 	var cx := int(px(c.x))
 	var st := maxi(1, int(step))
@@ -256,9 +278,10 @@ static func screen_dots_rot(ci: CanvasItem, c: Vector2, r: float, step := 3.0, c
 		while gx <= half:
 			# Rotate the lattice lookup, not the sample point, so the dots keep
 			# their 1px size and never smear.
-			var rx := float(gx) * cs - float(gy) * sn
-			var ry := float(gx) * sn + float(gy) * cs
-			if Vector2(rx, ry).length() <= rr - 1.0:
+			# Rotation preserves radius; reject outside samples before rotating.
+			if float(gx * gx + gy * gy) <= inner_sq:
+				var rx := float(gx) * cs - float(gy) * sn
+				var ry := float(gx) * sn + float(gy) * cs
 				var lx := int(roundf(rx))
 				var ly := int(roundf(ry))
 				var bx := (lx + 4 * 1024) & 3
@@ -365,9 +388,9 @@ static func glyph_rows(ch: String) -> Array[int]:
 		"2":
 			return [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111]
 		"3":
-			return [0b11111, 0b00010, 0b00100, 0b00100, 0b01000, 0b10000, 0b10000]
+			return [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110]
 		"4":
-			return [0b00010, 0b00100, 0b01000, 0b11111, 0b01000, 0b00100, 0b00010]
+			return [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010]
 		"5":
 			return [0b11111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b01110]
 		"6":

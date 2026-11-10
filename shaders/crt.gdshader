@@ -34,6 +34,7 @@ uniform sampler2D src_tex : filter_nearest, repeat_disable;
 uniform sampler2D src_lin : filter_linear, repeat_disable;
 
 uniform vec2 src_size = vec2(384.0, 216.0);
+uniform float unified_noise = 0.0;
 
 uniform float curvature : hint_range(0.0, 0.45) = 0.052;
 
@@ -109,6 +110,13 @@ uniform float bezel_thick = 1.4;
 
 uniform vec4 tint : source_color = vec4(1.0, 0.995, 0.970, 1.0);
 uniform vec4 bezel : source_color = vec4(0.045, 0.045, 0.043, 1.0);
+// Loop palette: low-saturation paper/ink pairs, blended at the end of the
+// optical chain so gameplay drawing stays palette-independent.
+uniform vec4 palette_dark : source_color = vec4(0.129, 0.129, 0.118, 1.0);
+uniform vec4 palette_light : source_color = vec4(0.925, 0.910, 0.851, 1.0);
+uniform float palette_strength : hint_range(0.0, 1.0) = 0.52;
+uniform float transition_glitch : hint_range(0.0, 1.0) = 0.0;
+uniform float transition_phase : hint_range(0.0, 1.0) = 1.0;
 
 float rnd(vec2 p) {
 	return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
@@ -233,6 +241,15 @@ float inkness(vec3 c) {
 void fragment() {
 	// Curvature first: everything downstream samples through `uvb`.
 	vec2 uvb = barrel(UV, curvature);
+	// Short signal tear on stage boundaries. Keep HUD readable and sample
+	// inside the original tube; the effect adds no bloom or gameplay objects.
+	float field_gate = smoothstep(0.20, 0.29, uvb.y) * (1.0 - smoothstep(0.80, 0.89, uvb.y));
+	float band = floor(uvb.y * 42.0);
+	float tick = floor(transition_phase * 22.0);
+	float band_noise = rnd(vec2(band, tick));
+	float tear = step(0.68, band_noise) * (band_noise - 0.68) * 2.8;
+	float inside_x = step(0.0, uvb.x) * step(uvb.x, 1.0);
+	uvb.x = mix(uvb.x, clamp(uvb.x + (tear - 0.12) * transition_glitch * field_gate * 0.025, 0.0, 1.0), inside_x);
 
 	// Outside the tube after warping: fill with the bezel colour. This is the
 	// ONLY place the bezel appears now.
@@ -552,6 +569,23 @@ void fragment() {
 		col *= exposure;
 		col = col * (1.0 - lift) + lift * lift_target;
 		col *= tint.rgb;
+
+		// Re-map luminance into the current paper/ink pair. Saturation stays
+		// restrained, while near-white cores keep their original highlight.
+		float tone_lum = dot(clamp(col, 0.0, 1.0), vec3(0.299, 0.587, 0.114));
+		vec3 tone = mix(palette_dark.rgb, palette_light.rgb, smoothstep(0.03, 0.98, tone_lum));
+		float preserve_core = smoothstep(0.84, 1.0, tone_lum);
+		tone = mix(tone, col, preserve_core * 0.82);
+		col = mix(col, tone, palette_strength);
+		float dropout = step(0.91, band_noise) * transition_glitch * field_gate;
+		float tracking = 1.0 - smoothstep(0.0, 0.009, abs(uvb.y - mix(0.24, 0.82, transition_phase)));
+		col *= 1.0 - dropout * 0.22;
+		col += vec3(0.045) * tracking * transition_glitch * field_gate;
+		// Final signal noise treats lettering, logo, artwork and field identically.
+		vec2 noise_cell = floor(uvb * src_size);
+		float noise_tick = floor(TIME * 18.0);
+		float signal_noise = rnd(noise_cell + vec2(noise_tick * 31.0, noise_tick * 17.0));
+		col += vec3((signal_noise - 0.5) * unified_noise);
 	}
 
 	COLOR = vec4(clamp(col, 0.0, 1.0), 1.0);

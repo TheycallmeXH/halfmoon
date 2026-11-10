@@ -38,6 +38,17 @@ var game: Node2D
 var tube: TextureRect
 var mat: ShaderMaterial
 var scale_now := 3
+@export var front_enabled := false
+var front: Node2D
+var front_view: SubViewport
+var front_tube: TextureRect
+var front_mat: ShaderMaterial
+var launch_active := false
+var launch_age := 0.0
+var launch_switched := false
+var launch_black: ColorRect
+const LAUNCH_SWITCH := 1.12
+const LAUNCH_DURATION := 1.92
 
 var bright: SubViewport
 var narrow_h: SubViewport
@@ -49,6 +60,19 @@ var combine: SubViewport
 
 var m_bright: ShaderMaterial
 var m_combine: ShaderMaterial
+var tone_dark := Color(0.129, 0.129, 0.118)
+var tone_light := Color(0.925, 0.910, 0.851)
+var tone_loop := -1
+var transition_age := 1.0
+const TRANSITION_TIME := 0.72
+
+const LOOP_PALETTES := [
+	[Color(0.129, 0.129, 0.118), Color(0.925, 0.910, 0.851)], # paper
+	[Color(0.145, 0.205, 0.198), Color(0.852, 0.884, 0.832)], # sage
+	[Color(0.230, 0.174, 0.190), Color(0.900, 0.824, 0.808)], # dusk rose
+	[Color(0.215, 0.222, 0.145), Color(0.906, 0.866, 0.738)], # ochre
+	[Color(0.150, 0.190, 0.225), Color(0.826, 0.866, 0.878)], # blue grey
+]
 
 
 func _ready() -> void:
@@ -75,6 +99,7 @@ func _ready() -> void:
 	game.name = "Halfmoon"
 	game.set_script(load("res://scripts/game.gd"))
 	screen.add_child(game)
+	game.stage_changed.connect(_begin_transition)
 
 	# ---- bloom chain -------------------------------------------------------
 	# Soft luminance extraction: no threshold, no ring. See bloom_bright.gdshader
@@ -154,30 +179,147 @@ func _ready() -> void:
 		probe.name = "PerfProbe"
 		probe.set_script(load("res://scripts/perf_probe.gd"))
 		add_child(probe)
-
 	if OS.get_environment("HALFMOON_BLOOMDEBUG") != "":
 		var dbg := Node.new()
 		dbg.name = "BloomDebug"
 		dbg.set_script(load("res://scripts/bloom_debug.gd"))
 		add_child(dbg)
-
 	if OS.get_environment("HALFMOON_DUMP") != "":
 		var dump := Node.new()
 		dump.name = "PassDump"
 		dump.set_script(load("res://scripts/pass_dump.gd"))
 		add_child(dump)
-
 	if OS.get_environment("HALFMOON_HILITE") != "":
 		var hi := Node2D.new()
 		hi.name = "HiliteProbe"
 		hi.set_script(load("res://scripts/hilite_probe.gd"))
 		screen.add_child(hi)
-
 	if OS.get_environment("HALFMOON_PATH") != "":
 		var pp := Node.new()
 		pp.name = "PathProbe"
 		pp.set_script(load("res://scripts/path_probe.gd"))
 		add_child(pp)
+
+	set_process(true)
+	if front_enabled:
+		_build_front()
+
+
+func _build_front() -> void:
+	game.front_managed = true
+	front_view = SubViewport.new()
+	front_view.name = "FrontScreen"
+	front_view.size = Vector2i(768, 432)
+	front_view.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	front_view.handle_input_locally = false
+	add_child(front_view)
+	front = Node2D.new()
+	front.set_script(load("res://scripts/front_menu.gd"))
+	front.preview_source = game
+	front_view.add_child(front)
+	front.start_requested.connect(_start_flight)
+	front.title_requested.connect(_show_title)
+	front.exit_requested.connect(_exit_game)
+	front_mat = mat.duplicate()
+	front_mat.set_shader_parameter("unified_noise", 0.15)
+	front_mat.set_shader_parameter("grain", 0.12)
+	front_mat.set_shader_parameter("grain_rate", 18.0)
+	front_mat.set_shader_parameter("src_size", Vector2(768, 432))
+	front_mat.set_shader_parameter("src_tex", front_view.get_texture())
+	front_mat.set_shader_parameter("src_lin", front_view.get_texture())
+	var black := Image.create(1, 1, false, Image.FORMAT_RGB8)
+	black.fill(Color.BLACK)
+	front_mat.set_shader_parameter("bloom_tex", ImageTexture.create_from_image(black))
+	front_mat.set_shader_parameter("transition_glitch", 0.0)
+	front_mat.set_shader_parameter("palette_dark", LOOP_PALETTES[0][0])
+	front_mat.set_shader_parameter("palette_light", LOOP_PALETTES[0][1])
+	front_tube = TextureRect.new()
+	front_tube.name = "FrontTube"
+	front_tube.texture = front_view.get_texture()
+	front_tube.material = front_mat
+	front_tube.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	front_tube.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(front_tube)
+	launch_black = ColorRect.new()
+	launch_black.color = Color(0, 0, 0, 0)
+	launch_black.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(launch_black)
+	launch_black.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	launch_black.hide()
+	_refit()
+	_show_title()
+
+
+func _exit_game() -> void:
+	get_tree().quit()
+
+
+func _show_title() -> void:
+	launch_active = false
+	launch_age = 0.0
+	launch_switched = false
+	launch_black.hide()
+	game.set_process(false)
+	game.paused = true
+	game.fire_buffer = 0.0
+	front.show_title()
+	front_view.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	front_tube.show()
+
+
+func _start_flight() -> void:
+	if launch_active:
+		return
+	launch_active = true
+	launch_age = 0.0
+	launch_switched = false
+	game.fire_buffer = 0.0
+	front.begin_departure()
+	launch_black.color.a = 0.0
+	launch_black.show()
+
+
+func _advance_launch(dt: float) -> void:
+	launch_age += clampf(dt, 0.0, 0.05)
+	if not launch_switched:
+		front.advance(dt)
+		var darkness := smoothstep(0.68, 1.04, launch_age)
+		launch_black.color.a = darkness
+		if launch_age >= LAUNCH_SWITCH:
+			launch_switched = true
+			game.reset()
+			game.paused = false
+			game.set_process(false)
+			game.queue_redraw()
+			front.hide()
+			front_view.render_target_update_mode = SubViewport.UPDATE_DISABLED
+			front_tube.hide()
+			tone_loop = 1
+			tone_dark = LOOP_PALETTES[0][0]
+			tone_light = LOOP_PALETTES[0][1]
+			mat.set_shader_parameter("palette_dark", tone_dark)
+			mat.set_shader_parameter("palette_light", tone_light)
+			mat.set_shader_parameter("transition_glitch", 0.0)
+			transition_age = TRANSITION_TIME
+	else:
+		launch_black.color.a = 1.0 - smoothstep(1.20, LAUNCH_DURATION, launch_age)
+	if launch_age >= LAUNCH_DURATION:
+		launch_active = false
+		launch_black.hide()
+		game.esc_held = Input.is_key_pressed(KEY_ESCAPE)
+		q_down = Input.is_key_pressed(KEY_Q)
+		e_down = Input.is_key_pressed(KEY_E)
+		game.set_process(true)
+
+
+func _front_pointer(position_in_window: Vector2) -> Vector2:
+	var uv := (position_in_window - front_tube.position) / front_tube.size
+	# Match the CRT's screen bend so hover and click stay on the printed text.
+	var centered := uv * 2.0 - Vector2.ONE
+	var curvature: float = front_mat.get_shader_parameter("curvature")
+	centered.x *= 1.0 + curvature * centered.y * centered.y
+	centered.y *= 1.0 + curvature * centered.x * centered.x
+	return (centered * 0.5 + Vector2(0.5, 0.5)) * Vector2(768, 432)
 
 
 # Create one full-bleed shader pass. Returns the SubViewport; the material
@@ -243,6 +385,10 @@ func _refit() -> void:
 
 	mat.set_shader_parameter("upscale", s)
 	mat.set_shader_parameter("bezel_thick", clamp(4.0 / max(1.0, s), 1.0, 4.0))
+	if front_tube != null:
+		front_tube.size = size
+		front_tube.position = tube.position
+		front_mat.set_shader_parameter("upscale", s * 0.5)
 
 
 # ------------------------------------------------------- weapon switch input
@@ -275,12 +421,41 @@ func _input(event: InputEvent) -> void:
 	# _input can fire before _ready has built the game node, so never assume it.
 	if game == null:
 		return
+	if launch_active:
+		get_viewport().set_input_as_handled()
+		return
+	if front != null and front.visible:
+		var front_key := event as InputEventKey
+		if front_key != null and front_key.pressed and not front_key.echo:
+			front.handle_key(front_key.keycode)
+		var motion := event as InputEventMouseMotion
+		if motion != null:
+			front.pointer(_front_pointer(motion.position))
+		var click := event as InputEventMouseButton
+		if click != null and click.pressed and click.button_index == MOUSE_BUTTON_LEFT:
+			front.pointer(_front_pointer(click.position))
+			if front.hovered >= 0:
+				front.activate()
+			else:
+				front.interact(_front_pointer(click.position))
+		get_viewport().set_input_as_handled()
+		return
+	var key := event as InputEventKey
+	if key != null and key.pressed and not key.echo and key.keycode == KEY_R:
+		game.request_reload()
+		return
+	if key != null and key.pressed and not key.echo:
+		if key.keycode in [KEY_X, KEY_Z, KEY_J] or (key.keycode == KEY_SPACE and game.gauge < 1.0):
+			game.queue_fire()
 	var mb := event as InputEventMouseButton
 	if mb == null:
 		return
 	# A wheel notch produces BOTH a pressed and a released event. Acting on the
 	# release as well would fire twice per notch and step two tiers.
 	if not mb.pressed:
+		return
+	if mb.button_index == MOUSE_BUTTON_LEFT:
+		game.queue_fire()
 		return
 	if mb.button_index == MOUSE_BUTTON_WHEEL_UP:
 		game.queue_wheel(-1)
@@ -296,7 +471,40 @@ func _input(event: InputEvent) -> void:
 # Keyboard fallback: Q = previous tier, E = next tier. Q/E are unused elsewhere
 # in this project (move is arrows/WASD, Shift inks, X/Z/J/LMB fire, Space erases,
 # ESC pauses, R restarts), so nothing else competes for them.
-func _process(_dt: float) -> void:
+func _process(dt: float) -> void:
+	if front != null:
+		if launch_active:
+			_advance_launch(dt)
+			return
+		if front.visible:
+			front.advance(dt)
+			return
+		if game.dead and game.dead_t >= 0.85:
+			game.set_process(false)
+			front.show_result({"score": game.score, "kills": game.kill_count,
+				"loop": game.loop_n, "time": game.run_elapsed})
+			front_view.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+			front_tube.show()
+			return
+	if game != null and mat != null:
+		var current_loop := maxi(1, int(game.get("loop_n")))
+		if current_loop != tone_loop:
+			if tone_loop >= 0:
+				_begin_transition()
+			tone_loop = current_loop
+		var target: Array = LOOP_PALETTES[(current_loop - 1) % LOOP_PALETTES.size()]
+		var blend := 1.0 - exp(-dt * 1.7)
+		tone_dark = tone_dark.lerp(target[0], blend)
+		tone_light = tone_light.lerp(target[1], blend)
+		mat.set_shader_parameter("palette_dark", tone_dark)
+		mat.set_shader_parameter("palette_light", tone_light)
+		if not bool(game.get("paused")):
+			transition_age = minf(TRANSITION_TIME, transition_age + minf(dt, 0.05))
+		var progress := clampf(transition_age / TRANSITION_TIME, 0.0, 1.0)
+		var pulse := sin(progress * PI) * (1.0 - progress * 0.6)
+		mat.set_shader_parameter("transition_glitch", maxf(0.0, pulse))
+		mat.set_shader_parameter("transition_phase", progress)
+
 	if game == null:
 		q_down = false
 		e_down = false
@@ -316,3 +524,7 @@ func _process(_dt: float) -> void:
 
 	q_down = q_now
 	e_down = e_now
+
+
+func _begin_transition() -> void:
+	transition_age = 0.0

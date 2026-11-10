@@ -39,13 +39,15 @@ float lum(vec3 c) {
 }
 
 void fragment() {
-	// Half-source-pixel offsets: a half-res target must not alias the 1px
-	// raster, or single-pixel sparks flicker in and out between frames.
-	vec2 px = vec2(1.0, 1.0) / vec2(textureSize(src, 0));
-	vec3 a = texture(src, UV + vec2(px.x * 0.5, 0.0)).rgb;
-	vec3 b = texture(src, UV - vec2(px.x * 0.5, 0.0)).rgb;
-	vec3 c = texture(src, UV + vec2(0.0, px.y * 0.5)).rgb;
-	vec3 d = texture(src, UV - vec2(0.0, px.y * 0.5)).rgb;
+	// Read exact centers of the source 2x2 block. Cross-shaped half-pixel
+	// offsets still bilinearly mixed a white pixel with its dark neighbour,
+	// losing isolated cores before MAX had a chance to preserve them.
+	vec2 source_size = vec2(textureSize(src, 0));
+	vec2 base = floor(UV * source_size * 0.5) * 2.0;
+	vec3 a = texture(src, (base + vec2(0.5, 0.5)) / source_size).rgb;
+	vec3 b = texture(src, (base + vec2(1.5, 0.5)) / source_size).rgb;
+	vec3 c = texture(src, (base + vec2(0.5, 1.5)) / source_size).rgb;
+	vec3 d = texture(src, (base + vec2(1.5, 1.5)) / source_size).rgb;
 
 	// MAX, not average: downsampling a 1px white core by averaging loses ~94%
 	// of its energy, which is how an earlier build produced a pure black
