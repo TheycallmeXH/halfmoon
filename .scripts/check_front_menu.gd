@@ -78,8 +78,9 @@ func _ready() -> void:
 		and front.GAME_TITLE == "SEISHIN ATTACK", "Game branding is inconsistent")
 	check(front.AUTHOR_LOGO.get_width() > 0, "Author logo failed to load")
 	check(front.preview_source == game, "Cover craft does not use player geometry source")
-	check(float(front_mat.get_shader_parameter("unified_noise")) > 0.1,
-		"Unified retro noise is disabled")
+	check(float(front_mat.get_shader_parameter("unified_noise")) > 0.0
+		and float(front_mat.get_shader_parameter("unified_noise")) <= 0.04,
+		"Unified retro noise is missing or too strong")
 	check(title.get_pixel(50, 200) == title.get_pixel(51, 200),
 		"Paper fibers or protected paper regions remain")
 	var idle: Image = front_view.get_texture().get_image()

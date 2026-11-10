@@ -271,7 +271,7 @@ func _draw() -> void:
 
 func _draw_title() -> void:
 	draw_texture_rect(AUTHOR_LOGO, Rect2(55, 27, 112, 28), false)
-	_text(Vector2(171, 49), "'s", 16, Color(INK, 0.8))
+	_text(Vector2(171, 54), "'s", 16, Color(INK, 0.8))
 	var width := font.get_string_size(GAME_TITLE, HORIZONTAL_ALIGNMENT_LEFT, -1, 48).x
 	var x := floorf((SIZE.x - width) * 0.5)
 	# Fixed-size oblique lettering and stepped extrusion, like an arcade cabinet print.

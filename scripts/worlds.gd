@@ -143,10 +143,6 @@ func _printed_ink(value: float, p: Vector2, curved: bool) -> Color:
 			level = i + (1 if rank < (value - edge + 0.024) / 0.048 else 0)
 			break
 	# Curved engraving carries the round forms; facets retain straight plate marks.
-	var bend := int(p.x * p.x * 0.0025) if curved else 0
-	var hatch := posmod(y + int(p.x * 0.35) + bend, 8)
-	if (level == 1 or level == 2) and hatch == 0:
-		level -= 1
 	var tone: float = PRINT_TONES[level]
 	return Color(Ink.INK.lerp(Ink.PAPER, tone), 0.96)
 
@@ -238,7 +234,7 @@ func _build() -> void:
 	_surface(globe, Vector2i(128, 128))
 	_fill_ellipse(globe, Vector2(58, 58), Color(Ink.INK, 0.88))
 	_relief(globe, "sphere", Vector2(58, 58))
-	for row in [-43, -31, -16, -11, 8, 13, 29, 42]:
+	for row in [-31, 13]:
 		var half := sqrt(54.0 * 54.0 - float(row * row))
 		for x in range(-int(half), int(half)):
 			var y: float = row + sin(x * 0.035 + row) * 3.0
@@ -246,7 +242,7 @@ func _build() -> void:
 				Ink.SOOT if row == -31 or row == 13 else Ink.INK.lerp(Ink.SOOT, 0.5))
 	_etch_ellipse(globe, Vector2(9, 3), Vector2(20, 25), Ink.MUTE)
 	_ellipse(globe, Vector2(58, 58), 0.58)
-	for row in [-34, -17, 8, 29]:
+	for row in [-17]:
 		var half := sqrt(54.0 * 54.0 - float(row * row))
 		for sample in int(half * 2):
 			var x := -half + sample
@@ -275,11 +271,6 @@ func _build() -> void:
 		_line(dust, Vector2(-size, -1), Vector2(size, 1), 0.30)
 		_line(dust, Vector2(size, 1), Vector2(-size * 0.4, size * 0.6), 0.24)
 		_line(dust, Vector2(-size * 0.4, size * 0.6), Vector2(-size, -1), 0.24)
-	for i in 2:
-		var flow := _layer(2, Vector2(224, 116), 0.006, Vector2(4, 1), i)
-		for j in 180:
-			var x := -110.0 + j
-			_point(flow, Vector2(x, sin(x * 0.025 + i) * 10.0 + i * 46.0 - 23.0), 0.14)
 	# Broken megastructure: an off-centre, screen-sized skeleton with clear gaps.
 	var ribs := _layer(3, Vector2(292, 122), -0.018, Vector2(2, 2))
 	_surface(ribs, Vector2i(256, 256))
@@ -303,10 +294,10 @@ func _build() -> void:
 		_etch_line(ribs, v1 * 119, v2 * 119, Ink.SOOT)
 		_etch_line(ribs, v1 * 105 + v1.orthogonal() * 4,
 			v1 * 117 + v1.orthogonal() * 4, Ink.SOOT)
-	for radius in [65, 72, 103, 110, 122]:
+	for radius in [103, 122]:
 		_ellipse(ribs, Vector2(radius, radius * 0.89), 0.26 if radius < 110 else 0.38,
 			0.0, Vector2.ZERO, true)
-	for i in 24:
+	for i in range(0, 24, 2):
 		if i % 7 == 0 or i % 7 == 1:
 			continue
 		var a := TAU * i / 24.0
@@ -330,15 +321,14 @@ func _build() -> void:
 		_relief(cell, "cell", radii)
 		_etch_ellipse(cell, radii - Vector2(3, 2), Vector2.ZERO, Ink.SOOT)
 		_etch_line(cell, Vector2(-radii.x + 5, 0), Vector2(radii.x - 5, 0), Ink.SOOT)
-		var pores := 9 if i == 0 else 5
+		var pores := 5 if i == 0 else 3
 		for j in pores:
 			var x := -radii.x * 0.7 + float(j) * radii.x * 1.4 / (pores - 1)
 			var height := sqrt(maxf(0.0, 1.0 - pow(x / radii.x, 2))) * radii.y
 			_etch_ellipse(cell, Vector2(2, height * 0.55), Vector2(x, 0), Ink.MUTE.lerp(Ink.SOOT, 0.3))
 		_ellipse(cell, radii, 0.40)
-		_ellipse(cell, radii - Vector2(3, 2), 0.20)
-		for j in 12:
-			var a := TAU * j / 12.0
+		for j in 6:
+			var a := TAU * j / 6.0
 			var p := Vector2(cos(a) * radii.x, sin(a) * radii.y)
 			_line(cell, p, p + p.normalized() * 4.0, 0.24)
 	# Crystal slice: engraved angular cells and parallel internal fault lines.
@@ -361,7 +351,7 @@ func _build() -> void:
 			_etch_line(crystal, vertices[j] * 0.91, vertices[(j + 1) % 6] * 0.91)
 		_etch_line(crystal, vertices[2] * 0.91, Vector2(radii.x * 0.34, radii.y * 0.2))
 		_etch_line(crystal, vertices[4] * 0.91, Vector2(radii.x * 0.34, radii.y * 0.2))
-		for j in 5:
+		for j in 2:
 			_etch_line(crystal, Vector2(-radii.x, -radii.y * 0.5 + j * 5),
 				Vector2(radii.x * 0.2, -radii.y * 0.1 + j * 5), Ink.SOOT)
 	for layer in layers:

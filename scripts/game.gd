@@ -6787,15 +6787,11 @@ func _draw_enemy_health(enemy: Dictionary, major: bool = false) -> void:
 	var position := (rect.position + Vector2((rect.size.x - width) * 0.5,
 		floorf((1.0 - visibility) * 2.0))).floor()
 	var track := Rect2(position, Vector2(width, 1))
-	# A single paper underscoring keeps the hairline legible on the dark moon.
-	draw_rect(Rect2(position + Vector2.DOWN, track.size), Color(PAPER, visibility * 0.70))
-	# Sparse sources light the white hairline through the existing bloom pass.
-	for pixel in range(3, int(width), 8):
-		draw_rect(Rect2(position + Vector2(pixel, 1), Vector2.ONE), Color(CORE, visibility))
 	draw_rect(track, Color(SOOT, visibility * 0.30))
 	var fraction := clampf(float(enemy.hp) / maxf(1.0, float(enemy.max)), 0.0, 1.0)
 	track.size.x = maxf(1.0, floorf(width * fraction))
-	draw_rect(track, Color(INK, visibility * 0.90))
+	# Only remaining health emits light; no underline or sources in the empty track.
+	draw_rect(track, Color(CORE, visibility))
 
 
 func draw_enemy_health() -> void:

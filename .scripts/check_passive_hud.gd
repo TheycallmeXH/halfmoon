@@ -127,18 +127,21 @@ func _ready() -> void:
 	var extracted: Image = bright.get_texture().get_image()
 	var cores := 0
 	for x in int(rect.size.x):
-		var p := Vector2i(rect.position) + Vector2i(x, 1)
+		var p := Vector2i(rect.position) + Vector2i(x, 0)
 		if source.get_pixelv(p).get_luminance() > 0.97:
 			cores += 1
 			check(extracted.get_pixel(p.x / 2, p.y / 2).r > 0.1, "Health source lost before bloom")
-	check(cores > 0 and cores <= 4, "Health glow exceeded its source budget")
+	check(cores == int(floor(rect.size.x * 0.6)), "Health glow does not match remaining HP")
+	for x in int(rect.size.x):
+		var p := Vector2i(rect.position) + Vector2i(x, 1)
+		check(source.get_pixelv(p).get_luminance() < 0.97, "Health underline still emits light")
 	get_viewport().get_texture().get_image().save_png("res://.shots/health-glow-crt.png")
 	game.health_clock = 2.1
 	game.queue_redraw()
 	for frame in 12:
 		await RenderingServer.frame_post_draw
 	extracted = bright.get_texture().get_image()
-	var p := Vector2i(rect.position) + Vector2i(3, 1)
+	var p := Vector2i(rect.position) + Vector2i(3, 0)
 	check(extracted.get_pixel(p.x / 2, p.y / 2).r < 0.001, "Hidden health bar retained glow")
 	print("PASSIVE_HUD checks=%d failures=%d" % [checked, failures])
 	get_tree().quit(1 if failures else 0)

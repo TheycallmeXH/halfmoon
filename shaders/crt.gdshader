@@ -583,7 +583,7 @@ void fragment() {
 		col += vec3(0.045) * tracking * transition_glitch * field_gate;
 		// Final signal noise treats lettering, logo, artwork and field identically.
 		vec2 noise_cell = floor(uvb * src_size);
-		float noise_tick = floor(TIME * 18.0);
+		float noise_tick = floor(TIME * grain_rate);
 		float signal_noise = rnd(noise_cell + vec2(noise_tick * 31.0, noise_tick * 17.0));
 		col += vec3((signal_noise - 0.5) * unified_noise);
 	}
