@@ -85,10 +85,16 @@ static func paper_edge(ci: CanvasItem, pts: PackedVector2Array) -> void:
 		return
 	for band in [Vector2(3.0, 0.045), Vector2(2.0, 0.14)]:
 		for contour in Geometry2D.offset_polygon(pts, band.x, Geometry2D.JOIN_ROUND):
+			# Snapping can merge corners into a self-touching outline. Preserve
+			# the valid offset topology before quantizing its triangle vertices.
+			var triangles := Geometry2D.triangulate_polygon(contour)
+			if triangles.is_empty():
+				continue
 			var pixels := PackedVector2Array()
 			for point in contour:
 				pixels.append(point.floor())
-			ci.draw_colored_polygon(pixels, Color(PAPER, band.y))
+			RenderingServer.canvas_item_add_triangle_array(ci.get_canvas_item(),
+				triangles, pixels, PackedColorArray([Color(PAPER, band.y)]))
 	for offset in [Vector2(-1, -1), Vector2(0, -1), Vector2(1, -1),
 			Vector2(-1, 0), Vector2(1, 0), Vector2(-1, 1), Vector2(0, 1), Vector2(1, 1)]:
 		var shifted := PackedVector2Array()

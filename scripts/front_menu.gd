@@ -40,6 +40,10 @@ var departure_age := 0.0
 var departure_origin := Vector2.ZERO
 var mechanical_time := 0.0
 var craft_layer: Node2D
+var feedback_layer: Node2D
+var pointer_active := false
+var cursor_lock := 0.0
+var click_kick := 0.0
 
 
 func _ready() -> void:
@@ -60,6 +64,9 @@ func _ready() -> void:
 	craft_layer = Node2D.new()
 	craft_layer.draw.connect(_draw_preview_ship.bind(craft_layer))
 	add_child(craft_layer)
+	feedback_layer = Node2D.new()
+	feedback_layer.draw.connect(_draw_feedback.bind(feedback_layer))
+	add_child(feedback_layer)
 
 
 func _reset_signal() -> void:
@@ -73,12 +80,17 @@ func _reset_signal() -> void:
 	signal_kick = 0.0
 	last_pulse = -1.0
 	pulses.clear()
+	pointer_active = false
+	cursor_lock = 0.0
+	click_kick = 0.0
 	ship_pos = Vector2(198, 191)
 	portrait.position = PORTRAIT_HOME
 	portrait_mat.set_shader_parameter("proximity", 0.0)
 	portrait_mat.set_shader_parameter("impact", 0.0)
 	if craft_layer != null:
 		craft_layer.queue_redraw()
+	if feedback_layer != null:
+		feedback_layer.queue_redraw()
 
 
 func show_title() -> void:
@@ -110,6 +122,8 @@ func advance(dt: float) -> void:
 	var step := clampf(dt, 0.0, 0.05)
 	age += step
 	hover_age += step
+	cursor_lock = lerpf(cursor_lock, 1.0 if hovered >= 0 else 0.0, 1.0 - exp(-step * 18.0))
+	click_kick = maxf(0.0, click_kick - step * 5.0)
 	mechanical_time = floorf(age * 18.0) / 18.0
 	# Servo holds for most of each cycle, then catches up with a short settling motion.
 	var servo_target := pointer_target.snapped(Vector2(0.08, 0.08))
@@ -136,12 +150,14 @@ func advance(dt: float) -> void:
 	portrait_mat.set_shader_parameter("proximity", portrait_hover)
 	portrait_mat.set_shader_parameter("impact", signal_kick)
 	craft_layer.queue_redraw()
+	feedback_layer.queue_redraw()
 	queue_redraw()
 
 
 func pointer(p: Vector2) -> void:
 	if departing:
 		return
+	pointer_active = Rect2(24, 20, 720, 392).has_point(p)
 	pointer_pos = p
 	pointer_target = ((p - SIZE * 0.5) / (SIZE * 0.5)).clamp(-Vector2.ONE, Vector2.ONE) \
 		if Rect2(24, 20, 720, 392).has_point(p) else Vector2.ZERO
@@ -158,6 +174,7 @@ func pointer(p: Vector2) -> void:
 	if hovered >= 0:
 		selected = hovered
 	queue_redraw()
+	feedback_layer.queue_redraw()
 
 
 func interact(p: Vector2) -> void:
@@ -166,17 +183,20 @@ func interact(p: Vector2) -> void:
 	if age < 0.35 or age - last_pulse < 0.12 or not Rect2(36, 124, 696, 280).has_point(p):
 		return
 	last_pulse = age
+	click_kick = 1.0
 	pulses.append({"position": p, "age": 0.0})
 	if pulses.size() > 6:
 		pulses.pop_front()
 	if PORTRAIT_AREA.has_point(p):
 		signal_kick = 1.0
 	queue_redraw()
+	feedback_layer.queue_redraw()
 
 
 func activate() -> void:
 	if age < 0.35 or departing:
 		return
+	click_kick = 1.0
 	if selected == (1 if mode == Mode.TITLE else 2):
 		exit_requested.emit()
 	elif selected == 1 and mode == Mode.RESULT:
@@ -188,6 +208,7 @@ func activate() -> void:
 func handle_key(keycode: Key) -> void:
 	if departing:
 		return
+	pointer_active = false
 	hovered = -1
 	if keycode in [KEY_UP, KEY_DOWN, KEY_TAB, KEY_W, KEY_S]:
 		var direction := -1 if keycode in [KEY_UP, KEY_W] else 1
@@ -208,6 +229,7 @@ func begin_departure() -> void:
 	departure_origin = ship_pos
 	hovered = -1
 	signal_kick = 0.65
+	pointer_active = false
 
 
 func _text(p: Vector2, value: String, size: int = 16, color: Color = INK) -> void:
@@ -327,29 +349,83 @@ func _draw_signal_field() -> void:
 			1 if corner.y < PORTRAIT_HOME.y else -1)
 		draw_line(p, p + Vector2(direction.x * 12, 0), Color(PAPER, 0.55), 1)
 		draw_line(p, p + Vector2(0, direction.y * 10), Color(PAPER, 0.55), 1)
+
+
+func _pulse_radius(p: Vector2) -> float:
+	var limit := minf(minf(p.x - 37, 731 - p.x), minf(p.y - 127, 403 - p.y))
+	var exclusions: Array[Rect2] = [PRIMARY.grow(6), SECONDARY.grow(6)]
+	if mode == Mode.RESULT:
+		exclusions.append(TERTIARY.grow(6))
+		exclusions.append(Rect2(68, 132, 300, 107))
+	for rect in exclusions:
+		var closest := p.clamp(rect.position, rect.end)
+		limit = minf(limit, p.distance_to(closest) - 1.0)
+	return clampf(limit, 0.0, 18.0)
+
+
+func _draw_feedback(canvas: Node2D) -> void:
 	for pulse in pulses:
-		var life: float = pulse.age / 0.8
+		var life: float = clampf(pulse.age / 0.8, 0.0, 1.0)
 		var p: Vector2 = pulse.position
-		var color := Color(PAPER if p.x > 430 else INK, (1.0 - life) * 0.45)
-		var reach := 5.0 + life * 38.0
-		# Broken diamond wave, deliberately mechanical rather than a soft glow.
-		for side in 4:
-			var angle := float(side) * PI * 0.5
-			var a := p + Vector2.from_angle(angle) * reach
-			var b := p + Vector2.from_angle(angle + PI * 0.5) * reach
-			a = a.lerp(b, 0.16)
-			b = b.lerp(p + Vector2.from_angle(angle) * reach, 0.16)
-			var segment_box := Rect2(a.min(b), (a - b).abs()).grow(1)
-			var clear := not segment_box.intersects(PRIMARY.grow(6)) \
-				and not segment_box.intersects(SECONDARY.grow(6))
-			if mode == Mode.RESULT:
-				clear = clear and not segment_box.intersects(TERTIARY.grow(6))
-			if clear and Rect2(36, 126, 696, 278).encloses(segment_box):
-				draw_line(a, b, color, 1)
-	if hovered < 0 and Rect2(40, 130, 680, 270).has_point(pointer_pos):
-		var tint := Color(PAPER if pointer_pos.x > 430 else INK, 0.45)
-		for direction in [Vector2.LEFT, Vector2.RIGHT, Vector2.UP, Vector2.DOWN]:
-			draw_line(pointer_pos + direction * 5, pointer_pos + direction * 10, tint, 1)
+		var limit := _pulse_radius(p)
+		if limit < 3.0:
+			continue
+		var reach := lerpf(2.0, limit, 1.0 - pow(1.0 - life, 2.0))
+		var color := Color(PAPER if p.x > 430 else INK, pow(1.0 - life, 1.5) * 0.55)
+		# Fit the whole ring rather than clipping individual sides.
+		canvas.draw_arc(p, reach, 0.0, TAU, 33, color, 1, true)
+	if not pointer_active or departing:
+		return
+	var p := pointer_pos.snapped(Vector2(0.5, 0.5))
+	var light := PAPER if hovered >= 0 or p.x > 430 else INK
+	var dark := INK if light == PAPER else PAPER
+	# Open corners leave the exact hit point unobstructed.
+	var radius := lerpf(6.0, 4.5, cursor_lock) - click_kick
+	for direction in [Vector2(-1, -1), Vector2(1, -1), Vector2(-1, 1), Vector2(1, 1)]:
+		var root: Vector2 = p + direction * radius
+		var corner := PackedVector2Array([root - Vector2(direction.x * 2.5, 0),
+			root, root - Vector2(0, direction.y * 2.5)])
+		canvas.draw_polyline(corner, Color(dark, 0.45), 2, true)
+		canvas.draw_polyline(corner, Color(light, 0.95), 1, true)
+	if hovered >= 0 and click_kick > 0:
+		var rect: Rect2 = [PRIMARY, SECONDARY, TERTIARY][hovered]
+		canvas.draw_rect(rect, Color(PAPER, click_kick * 0.16))
+
+
+func _draw_exhaust(canvas: Node2D) -> void:
+	var thrust := smoothstep(0.0, 0.38, departure_age) if departing else 0.0
+	var flicker := sin(age * 47.0) * 0.5 + sin(age * 79.0) * 0.25
+	var length := 9.0 + thrust * 53.0 + flicker * (1.0 + thrust * 3.0)
+	var width := 1.3 + thrust * 2.2
+	var nozzle := Vector2(-12, 0)
+	# All exhaust geometry uses the hull transform: root stays pinned during banking.
+	canvas.draw_colored_polygon(PackedVector2Array([nozzle + Vector2(0, -1.2),
+		nozzle + Vector2(-length * 0.22, -width),
+		nozzle + Vector2(-length, -0.4), nozzle + Vector2(-length * 1.08, 0),
+		nozzle + Vector2(-length * 0.65, width * 0.5),
+		nozzle + Vector2(-length * 0.2, width), nozzle + Vector2(0, 1.2)]), Color(INK, 0.9))
+	canvas.draw_colored_polygon(PackedVector2Array([nozzle + Vector2(0, -0.8),
+		nozzle + Vector2(-length * 0.2, -width * 0.55),
+		nozzle + Vector2(-length * 0.86, 0),
+		nozzle + Vector2(-length * 0.2, width * 0.55),
+		nozzle + Vector2(0, 0.8)]), Color(PAPER, 0.95))
+	canvas.draw_line(nozzle, nozzle + Vector2(-length * 0.65, 0),
+		Color(1, 0.98, 0.86, 0.9), 0.7, true)
+	if thrust < 0.05:
+		return
+	for i in 4:
+		var x := -5.0 - i * (5.0 + thrust * 5.0)
+		var breadth := width * (0.65 - i * 0.1)
+		canvas.draw_polyline(PackedVector2Array([nozzle + Vector2(x + 2, 0),
+			nozzle + Vector2(x, -breadth), nozzle + Vector2(x - 3, 0),
+			nozzle + Vector2(x, breadth), nozzle + Vector2(x + 2, 0)]),
+			Color(INK, thrust * 0.45), 0.6, true)
+	for i in 12:
+		var phase := fposmod(departure_age * (1.8 + i % 3 * 0.22) + i * 0.137, 1.0)
+		var spread := sin(i * 7.3) * (1.0 + phase * 5.0) * thrust
+		var ember := nozzle + Vector2(-length * (0.3 + phase * 1.35), spread)
+		canvas.draw_line(ember, ember + Vector2(-1 - phase * 4, 0),
+			Color(INK, (1.0 - phase) * thrust * 0.45), 0.6, true)
 
 
 func _draw_preview_ship(canvas: Node2D) -> void:
@@ -360,16 +436,9 @@ func _draw_preview_ship(canvas: Node2D) -> void:
 		var x := 84 + i * 14
 		var wave := floorf(sin(float(i) * 0.65 - mechanical_time * 2.2) * (3.0 + signal_kick * 7.0))
 		canvas.draw_line(Vector2(x, 222), Vector2(x, 222 - wave), Color(INK, 0.18), 1)
-	for i in 3:
-		var length := 10 + i * 7 + int(fposmod(age * 32, 4))
-		canvas.draw_line(p + Vector2(-17 - length, i * 3 - 3),
-			p + Vector2(-18, i * 3 - 3), Color(INK, 0.12 + i * 0.08), 1)
-	if departing:
-		var thrust := clampf(departure_age / 0.35, 0.0, 1.0)
-		for i in 4:
-			var length := 15.0 + thrust * 70.0 + float(i) * 8.0
-			canvas.draw_line(p + Vector2(-25, (i - 2) * 2),
-				p + Vector2(-length, (i - 2) * 3), Color(INK, 0.48 - i * 0.09), 1)
+	canvas.draw_set_transform(p, parallax.y * 0.08, Vector2(2, 2))
+	_draw_exhaust(canvas)
+	canvas.draw_set_transform(Vector2.ZERO)
 	if is_instance_valid(preview_source):
 		# Use the actual player's geometry, including its asymmetric fins and blunt nose.
 		canvas.draw_set_transform(p, parallax.y * 0.08, Vector2(2, 2))

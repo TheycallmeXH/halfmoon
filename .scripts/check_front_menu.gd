@@ -98,6 +98,23 @@ func _ready() -> void:
 					escaped += 1
 	check(changed > 500, "Hover has no reverse-video response")
 	check(escaped == 0, "Hover corrupted title typography")
+	check(front.pointer_active and front.cursor_lock > 0.5,
+		"Pointer did not acquire the hovered command")
+	await get_tree().process_frame
+	await RenderingServer.frame_post_draw
+	var with_cursor: Image = front_view.get_texture().get_image()
+	with_cursor.save_png("res://.shots/title-cursor-native.png")
+	get_viewport().get_texture().get_image().save_png("res://.shots/title-cursor-crt.png")
+	front.feedback_layer.hide()
+	await get_tree().process_frame
+	await RenderingServer.frame_post_draw
+	check(with_cursor.get_region(Rect2i(198, 253, 24, 30)).get_data() !=
+		front_view.get_texture().get_image().get_region(Rect2i(198, 253, 24, 30)).get_data(),
+		"Custom cursor is missing above command")
+	check(with_cursor.get_region(Rect2i(209, 267, 2, 2)).get_data() ==
+		front_view.get_texture().get_image().get_region(Rect2i(209, 267, 2, 2)).get_data(),
+		"Cursor center is obstructed by an arrow or decoration")
+	front.feedback_layer.show()
 	get_viewport().get_texture().get_image().save_png("res://.shots/title-hover-crt.png")
 	front.pointer(front.PRIMARY.get_center())
 	front.advance(0.05)
@@ -154,15 +171,23 @@ func _ready() -> void:
 	for i in 60:
 		front.advance(0.016)
 	check(front.pulses.is_empty() and front.signal_kick == 0.0, "Click effect did not expire")
+	check(front.click_kick == 0.0, "Click cursor compression did not recover")
 	front.interact(Vector2(-50, 200))
 	check(front.pulses.is_empty(), "Letterbox click triggered signal wave")
 	front.show_title()
 	check(front.parallax == Vector2.ZERO and front.portrait_hover == 0.0,
 		"New menu retained pointer state")
+	check(not front.pointer_active and front.click_kick == 0.0,
+		"Menu reset retained cursor feedback")
 	front.age = 0.5
 	front.interact(Vector2(150, 160))
 	check(front.pulses.size() == 1 and front.signal_kick == 0.0,
 		"Background signal wave missing or corrupted portrait")
+	check(front._pulse_radius(Vector2(150, 160)) == 18.0,
+		"Click ring exceeds its restrained radius")
+	check(front._pulse_radius(Vector2(150, 238)) <= 3.0
+		and front._pulse_radius(Vector2(40, 160)) <= 3.0,
+		"Click ring does not shrink as a whole near a button or border")
 	var max_pulses := 0
 	for i in 100:
 		front.advance(0.016)
@@ -197,7 +222,19 @@ func _ready() -> void:
 	held_confirm.keycode = KEY_ENTER
 	held_confirm.pressed = true
 	Input.parse_input_event(held_confirm)
-	for i in 42:
+	for i in 14:
+		_process(1.0 / 60)
+	check(front.ship_pos.x < departure_start.x, "Launch skipped engine spool recoil")
+	await RenderingServer.frame_post_draw
+	get_viewport().get_texture().get_image().save_png("res://.shots/launch-spool.png")
+	for i in 14:
+		_process(1.0 / 60)
+	check(not front.pointer_active and front.departure_age > 0.38,
+		"Departure retained cursor or skipped exhaust ignition")
+	await RenderingServer.frame_post_draw
+	front_view.get_texture().get_image().save_png("res://.shots/launch-exhaust-native.png")
+	get_viewport().get_texture().get_image().save_png("res://.shots/launch-exhaust-crt.png")
+	for i in 14:
 		_process(1.0 / 60)
 	check(front.ship_pos.x > departure_start.x + 200 and not game.is_processing(),
 		"Ship failed to fly out before gameplay")

@@ -415,6 +415,21 @@ func _refit() -> void:
 # blur.
 var q_down := false
 var e_down := false
+var menu_cursor_hidden := false
+
+
+func _exit_tree() -> void:
+	if menu_cursor_hidden:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+
+
+func _sync_menu_cursor() -> void:
+	var hide_cursor: bool = front != null and ((front.visible and front.pointer_active) \
+		or launch_active) and get_window().has_focus() \
+		and front_tube.get_global_rect().has_point(get_global_mouse_position())
+	if hide_cursor != menu_cursor_hidden:
+		menu_cursor_hidden = hide_cursor
+		Input.mouse_mode = Input.MOUSE_MODE_HIDDEN if hide_cursor else Input.MOUSE_MODE_VISIBLE
 
 
 func _input(event: InputEvent) -> void:
@@ -472,6 +487,7 @@ func _input(event: InputEvent) -> void:
 # in this project (move is arrows/WASD, Shift inks, X/Z/J/LMB fire, Space erases,
 # ESC pauses, R restarts), so nothing else competes for them.
 func _process(dt: float) -> void:
+	_sync_menu_cursor()
 	if front != null:
 		if launch_active:
 			_advance_launch(dt)
